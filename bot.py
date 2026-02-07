@@ -6,12 +6,7 @@ from datetime import datetime, timedelta
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-)
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
@@ -19,14 +14,19 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 URL = "https://www.roe.vsei.ua/disconnections/"
+
+# інтервали на сайті — це години ВІДКЛЮЧЕННЯ
 TIME_RANGE_RE = re.compile(r"(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})")
+UPDATE_RE = re.compile(r"Оновлено:\s*\d{2}\.\d{2}\.\d{4}\s*\d{2}:\d{2}")
 
 SITE_CHECK_EVERY_SECONDS = 300   # 5 хв
 NOTICE_MINUTES = 10              # за 10 хв
+PREALERT_WINDOW_SECONDS = 120    # 2 хв вікно, щоб не промахнутись
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# in-memory storage
 USER_SUBQUEUE: dict[int, str] = {}
 USER_LAST_HASH: dict[int, str] = {}
 USER_LAST_SCHEDULE: dict[int, list[tuple[str, str]]] = {}
@@ -65,11 +65,14 @@ async def fetch_html() -> str:
 
 
 def _find_update_marker(full_text: str) -> str | None:
-    m = re.search(r"Оновлено:\s*\d{2}\.\d{2}\.\d{4}\s*\d{2}:\d{2}", full_text)
+    m = UPDATE_RE.search(full_text)
     return m.group(0) if m else None
 
 
 def _html_table_to_matrix(table) -> list[list[str]]:
+    """
+    Перетворює HTML-таблицю в матрицю з урахуванням rowspan/colspan.
+    """
     rows = table.find_all("tr")
     grid: list[list[str]] = []
     span_map: dict[tuple[int, int], dict] = {}
@@ -107,7 +110,7 @@ def _html_table_to_matrix(table) -> list[list[str]]:
         fill_spans_until_free()
         grid.append(grid_row)
 
-    max_cols = max(len(r) for r in grid) if grid else 0
+    max_cols = max((len(r) for r in grid), default=0)
     for r in grid:
         if len(r) < max_cols:
             r.extend([""] * (max_cols - len(r)))
@@ -116,6 +119,10 @@ def _html_table_to_matrix(table) -> list[list[str]]:
 
 
 def parse_schedule_for_subqueue(html: str, subqueue: str) -> tuple[str | None, list[tuple[str, str]]]:
+    """
+    Повертає (update_marker, intervals) для підчерги.
+    intervals — інтервали ВІДКЛЮЧЕННЯ.
+    """
     soup = BeautifulSoup(html, "lxml")
     full_text = soup.get_text("\n", strip=True)
     update_marker = _find_update_marker(full_text)
@@ -148,9 +155,12 @@ def parse_schedule_for_subqueue(html: str, subqueue: str) -> tuple[str | None, l
         cell_text = (r[col_idx] or "").strip()
         if not cell_text:
             continue
+        if "Очікується" in cell_text:
+            continue
         for a, b in TIME_RANGE_RE.findall(cell_text):
             intervals.append((a, b))
 
+    # прибираємо дублікати, зберігаючи порядок
     uniq: list[tuple[str, str]] = []
     seen = set()
     for it in intervals:
@@ -170,11 +180,11 @@ def format_schedule(subqueue: str, intervals: list[tuple[str, str]], update_mark
     today = datetime.now().strftime("%d.%m.%Y")
     if not intervals:
         msg = (
-            f"Графік для {subqueue} на {today}:\n"
+            f"Графік (ВІДКЛЮЧЕННЯ) для {subqueue} на {today}:\n"
             f"⚠️ Інтервали не знайдено (можливо на сайті ще “Очікується” або змінилась таблиця)."
         )
     else:
-        lines = [f"Графік для {subqueue} на {today}:"]
+        lines = [f"Графік (ВІДКЛЮЧЕННЯ) для {subqueue} на {today}:"]
         for a, b in intervals:
             lines.append(f"• {a}–{b}")
         msg = "\n".join(lines)
@@ -188,6 +198,49 @@ def _dt_today(hhmm: str) -> datetime:
     hh, mm = hhmm.split(":")
     now = datetime.now()
     return now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+
+
+def is_off_now(intervals: list[tuple[str, str]], now: datetime) -> bool:
+    """
+    intervals — інтервали ВІДКЛЮЧЕННЯ.
+    Повертає True якщо зараз у відключенні.
+    """
+    for a, b in intervals:
+        st = _dt_today(a)
+        en = _dt_today(b)
+        if b == "23:59":
+            en = en.replace(second=59)
+        if st <= now <= en:
+            return True
+    return False
+
+
+def next_event(intervals: list[tuple[str, str]], now: datetime) -> tuple[datetime | None, str | None]:
+    """
+    Повертає найближчу подію:
+      ("OFF") -> початок відключення
+      ("ON")  -> відновлення (кінець поточного інтервалу)
+    """
+    # 1) якщо зараз у відключенні -> найближче ON на кінці інтервалу
+    for a, b in intervals:
+        st = _dt_today(a)
+        en = _dt_today(b)
+        if b == "23:59":
+            en = en.replace(second=59)
+        if st <= now <= en:
+            return en, "ON"
+
+    # 2) якщо зараз світло є -> найближче OFF на старті наступного інтервалу
+    future = []
+    for a, _b in intervals:
+        st = _dt_today(a)
+        if st > now:
+            future.append(st)
+
+    if future:
+        return min(future), "OFF"
+
+    return None, None
 
 
 async def site_watcher_loop():
@@ -239,37 +292,31 @@ async def reminders_loop():
                 notified = USER_NOTIFIED_KEYS.setdefault(chat_id, set())
                 day_key = now.strftime("%Y-%m-%d")
 
-                for a, b in intervals:
-                    start_dt = _dt_today(a)
-                    end_dt = _dt_today(b)
+                event_dt, event_type = next_event(intervals, now)
+                if not event_dt or not event_type:
+                    continue
 
-                    off_notify_time = start_dt - timedelta(minutes=NOTICE_MINUTES)
-                    on_notify_time = end_dt - timedelta(minutes=NOTICE_MINUTES)
+                notify_time = event_dt - timedelta(minutes=NOTICE_MINUTES)
 
-                    if off_notify_time <= now < off_notify_time + timedelta(seconds=60):
-                        key = f"{day_key}|{subqueue}|OFF|{a}"
-                        if key not in notified:
-                            notified.add(key)
-                            await bot.send_message(
-                                chat_id,
-                                "За 10 хвилин можливе відключення світла",
-                                reply_markup=keyboard_manage()
-                            )
+                # Вікно 2 хв, щоб не промахнутись
+                if notify_time <= now < notify_time + timedelta(seconds=PREALERT_WINDOW_SECONDS):
+                    key = f"{day_key}|{subqueue}|{event_type}|{event_dt.strftime('%H:%M')}"
+                    if key not in notified:
+                        notified.add(key)
 
-                    if on_notify_time <= now < on_notify_time + timedelta(seconds=60):
-                        key = f"{day_key}|{subqueue}|ON|{b}"
-                        if key not in notified:
-                            notified.add(key)
-                            await bot.send_message(
-                                chat_id,
-                                "За 10 хвилин очікується відновлення світла",
-                                reply_markup=keyboard_manage()
-                            )
+                        if event_type == "OFF":
+                            text = f"⛔️ За {NOTICE_MINUTES} хв очікується ВІДКЛЮЧЕННЯ світла (о {event_dt.strftime('%H:%M')})"
+                        else:
+                            text = f"💡 За {NOTICE_MINUTES} хв очікується ВІДНОВЛЕННЯ світла (о {event_dt.strftime('%H:%M')})"
+
+                        await bot.send_message(chat_id, text, reply_markup=keyboard_manage())
         except Exception:
             pass
 
         await asyncio.sleep(60)
 
+
+# --- Команди/кнопки ---
 
 @dp.message(F.text == "/start")
 async def start(message: Message):
@@ -280,6 +327,50 @@ async def start(message: Message):
         "👇 Натисни кнопку:",
         reply_markup=keyboard_choose_subqueue()
     )
+
+
+@dp.message(F.text == "/schedule")
+async def cmd_schedule(message: Message):
+    chat_id = message.chat.id
+    if chat_id not in USER_SUBQUEUE:
+        await message.answer("⚠️ Спочатку обери підчергу через /start")
+        return
+    subqueue = USER_SUBQUEUE[chat_id]
+    intervals = USER_LAST_SCHEDULE.get(chat_id, [])
+    await message.answer(format_schedule(subqueue, intervals, None), reply_markup=keyboard_manage())
+
+
+@dp.message(F.text == "/status")
+async def cmd_status(message: Message):
+    chat_id = message.chat.id
+    if chat_id not in USER_SUBQUEUE:
+        await message.answer("⚠️ Спочатку обери підчергу через /start")
+        return
+
+    subqueue = USER_SUBQUEUE[chat_id]
+    intervals = USER_LAST_SCHEDULE.get(chat_id, [])
+    if not intervals:
+        await message.answer("Немає інтервалів (можливо 'Очікується').", reply_markup=keyboard_manage())
+        return
+
+    now = datetime.now()
+    off = is_off_now(intervals, now)
+    ev_dt, ev_type = next_event(intervals, now)
+
+    txt = "❌ ЗАРАЗ ВІДКЛЮЧЕННЯ" if off else "✅ ЗАРАЗ Є СВІТЛО"
+    tail = ""
+    if ev_dt and ev_type:
+        if ev_type == "OFF":
+            tail = f"\nНайближче: відключення о {ev_dt.strftime('%H:%M')}"
+        else:
+            tail = f"\nНайближче: відновлення о {ev_dt.strftime('%H:%M')}"
+
+    await message.answer(f"{txt}\nПідчерга: {subqueue}{tail}", reply_markup=keyboard_manage())
+
+
+@dp.message(F.text == "/time")
+async def cmd_time(message: Message):
+    await message.answer(f"Server time: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
 
 
 @dp.callback_query(F.data == "change")
@@ -333,7 +424,7 @@ async def test_off(message: Message):
     if message.chat.id not in USER_SUBQUEUE:
         await message.answer("⚠️ Спочатку обери підчергу через /start")
         return
-    await message.answer("За 10 хвилин можливе відключення світла", reply_markup=keyboard_manage())
+    await message.answer("⛔️ За 10 хв очікується ВІДКЛЮЧЕННЯ світла (тест)", reply_markup=keyboard_manage())
 
 
 @dp.message(F.text == "/test_on")
@@ -341,22 +432,17 @@ async def test_on(message: Message):
     if message.chat.id not in USER_SUBQUEUE:
         await message.answer("⚠️ Спочатку обери підчергу через /start")
         return
-    await message.answer("За 10 хвилин очікується відновлення світла", reply_markup=keyboard_manage())
+    await message.answer("💡 За 10 хв очікується ВІДНОВЛЕННЯ світла (тест)", reply_markup=keyboard_manage())
 
 
 @dp.message(F.text == "/test_update")
 async def test_update(message: Message):
-    """
-    Симуляція "оновився графік": показує, як виглядатиме push при зміні інтервалів.
-    """
     chat_id = message.chat.id
     if chat_id not in USER_SUBQUEUE:
         await message.answer("⚠️ Спочатку обери підчергу через /start")
         return
 
     subqueue = USER_SUBQUEUE[chat_id]
-
-    # умовний "новий графік" (для демонстрації)
     demo_intervals = [("06:00", "13:00"), ("15:00", "21:00"), ("23:00", "23:59")]
     demo_marker = f"Оновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
 
