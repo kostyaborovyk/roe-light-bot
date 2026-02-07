@@ -3,6 +3,7 @@ import os
 import re
 import hashlib
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -22,6 +23,15 @@ UPDATE_RE = re.compile(r"Оновлено:\s*\d{2}\.\d{2}\.\d{4}\s*\d{2}:\d{2}")
 SITE_CHECK_EVERY_SECONDS = 300   # 5 хв
 NOTICE_MINUTES = 10              # за 10 хв
 PREALERT_WINDOW_SECONDS = 120    # 2 хв вікно, щоб не промахнутись
+
+# --- TIMEZONE (fixed) ---
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+
+def now_kiev() -> datetime:
+    # timezone-aware datetime
+    return datetime.now(KYIV_TZ)
+
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -177,7 +187,7 @@ def schedule_hash(intervals: list[tuple[str, str]]) -> str:
 
 
 def format_schedule(subqueue: str, intervals: list[tuple[str, str]], update_marker: str | None) -> str:
-    today = datetime.now().strftime("%d.%m.%Y")
+    today = now_kiev().strftime("%d.%m.%Y")
     if not intervals:
         msg = (
             f"Графік (ВІДКЛЮЧЕННЯ) для {subqueue} на {today}:\n"
@@ -196,7 +206,8 @@ def format_schedule(subqueue: str, intervals: list[tuple[str, str]], update_mark
 
 def _dt_today(hhmm: str) -> datetime:
     hh, mm = hhmm.split(":")
-    now = datetime.now()
+    now = now_kiev()
+    # keep tz-aware datetime
     return now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
 
 
@@ -283,7 +294,7 @@ async def site_watcher_loop():
 async def reminders_loop():
     while True:
         try:
-            now = datetime.now()
+            now = now_kiev()
             for chat_id, subqueue in list(USER_SUBQUEUE.items()):
                 intervals = USER_LAST_SCHEDULE.get(chat_id, [])
                 if not intervals:
@@ -353,7 +364,7 @@ async def cmd_status(message: Message):
         await message.answer("Немає інтервалів (можливо 'Очікується').", reply_markup=keyboard_manage())
         return
 
-    now = datetime.now()
+    now = now_kiev()
     off = is_off_now(intervals, now)
     ev_dt, ev_type = next_event(intervals, now)
 
@@ -370,7 +381,7 @@ async def cmd_status(message: Message):
 
 @dp.message(F.text == "/time")
 async def cmd_time(message: Message):
-    await message.answer(f"Server time: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+    await message.answer(f"Server time: {now_kiev().strftime('%d.%m.%Y %H:%M:%S')}")
 
 
 @dp.callback_query(F.data == "change")
@@ -444,7 +455,7 @@ async def test_update(message: Message):
 
     subqueue = USER_SUBQUEUE[chat_id]
     demo_intervals = [("06:00", "13:00"), ("15:00", "21:00"), ("23:00", "23:59")]
-    demo_marker = f"Оновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    demo_marker = f"Оновлено: {now_kiev().strftime('%d.%m.%Y %H:%M')}"
 
     await message.answer(
         f"🔄 Оновився графік по підчерзі {subqueue}\n\n{format_schedule(subqueue, demo_intervals, demo_marker)}",
