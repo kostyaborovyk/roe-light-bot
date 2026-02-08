@@ -1,8 +1,9 @@
 import asyncio
 import os
 import re
+import json
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -11,63 +12,137 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-# ---------------- CONFIG ----------------
-
+# =========================
+# CONFIG
+# =========================
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # твій Telegram user id (через @userinfobot)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or "0")
 
 URL = "https://www.roe.vsei.ua/disconnections/"
 
-# інтервали на сайті — це години ВІДКЛЮЧЕННЯ
+TZ = ZoneInfo("Europe/Kyiv")
+
+SITE_CHECK_EVERY_SECONDS = 300          # 5 хв
+PREALERT_WINDOW_SECONDS = 120           # 2 хв вікно
+DEFAULT_NOTICE_MINUTES = 10
+ALLOWED_NOTICE = {5, 10, 30}
+
+STATE_FILE = "state.json"               # простий json в робочій директорії
+
+# Парсинг
 TIME_RANGE_RE = re.compile(r"(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})")
 UPDATE_RE = re.compile(r"Оновлено:\s*\d{2}\.\d{2}\.\d{4}\s*\d{2}:\d{2}")
+DATE_RE = re.compile(r"\b(\d{2}\.\d{2}\.\d{4})\b")
 
-SITE_CHECK_EVERY_SECONDS = 300   # 5 хв
-NOTICE_MINUTES = 10              # за 10 хв
-PREALERT_WINDOW_SECONDS = 120    # 2 хв вікно
-
-# Київський час (незалежно від UTC на Render)
-KYIV_TZ = ZoneInfo("Europe/Kyiv")
-
-# Broadcast subscribers
-SUBSCRIBERS_FILE = "subscribers.txt"
-
-
-def now_kiev() -> datetime:
-    return datetime.now(KYIV_TZ)
-
-
-def load_subscribers() -> set[int]:
-    try:
-        with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
-            return {int(line.strip()) for line in f if line.strip().isdigit()}
-    except FileNotFoundError:
-        return set()
-
-
-def save_subscriber(chat_id: int) -> None:
-    subs = load_subscribers()
-    if chat_id in subs:
-        return
-    subs.add(chat_id)
-    with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
-        for cid in sorted(subs):
-            f.write(f"{cid}\n")
-
+# =========================
+# BOT INIT
+# =========================
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing. Add BOT_TOKEN to environment variables.")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# in-memory storage
+# =========================
+# IN-MEMORY STATE
+# =========================
+# chat_id -> subqueue
 USER_SUBQUEUE: dict[int, str] = {}
+
+# chat_id -> notice minutes
+USER_NOTICE: dict[int, int] = {}
+
+# chat_id -> last hash of schedule (for update detection)
 USER_LAST_HASH: dict[int, str] = {}
-USER_LAST_SCHEDULE: dict[int, list[tuple[str, str]]] = {}
+
+# chat_id -> last parsed schedule for chosen subqueue: { "dd.mm.yyyy": [(a,b), ...], ... }
+USER_LAST_SCHEDULE: dict[int, dict[str, list[tuple[str, str]]]] = {}
+
+# chat_id -> last "Оновлено: ..."
+USER_LAST_UPDATE_MARKER: dict[int, str | None] = {}
+
+# chat_id -> set of notification keys (avoid duplicates)
 USER_NOTIFIED_KEYS: dict[int, set[str]] = {}
 
-# ---------------- UI ----------------
+# all known users (for broadcast / stats)
+ALL_USERS: set[int] = set()
 
 
+# =========================
+# PERSISTENCE (JSON)
+# =========================
+def load_state() -> None:
+    """
+    Load state from STATE_FILE if possible.
+    If file missing or invalid -> ignore (bot still works).
+    """
+    global USER_SUBQUEUE, USER_NOTICE, ALL_USERS
+    try:
+        if not os.path.exists(STATE_FILE):
+            return
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Basic shape:
+        # {
+        #   "users": {
+        #       "123": {"subqueue": "5.1", "notice": 10},
+        #       ...
+        #   }
+        # }
+        users = data.get("users", {})
+        for chat_id_str, u in users.items():
+            try:
+                cid = int(chat_id_str)
+            except ValueError:
+                continue
+
+            ALL_USERS.add(cid)
+
+            sq = (u.get("subqueue") or "").strip()
+            if sq:
+                USER_SUBQUEUE[cid] = sq
+
+            notice = u.get("notice")
+            if isinstance(notice, int) and notice in ALLOWED_NOTICE:
+                USER_NOTICE[cid] = notice
+            else:
+                USER_NOTICE.setdefault(cid, DEFAULT_NOTICE_MINUTES)
+
+    except Exception as e:
+        print(f"[STATE] load_state failed: {e}")
+
+
+def save_state() -> None:
+    """
+    Save minimal state for users: subqueue + notice.
+    If save fails -> ignore (bot still works).
+    """
+    try:
+        users_obj: dict[str, dict] = {}
+        for cid in ALL_USERS:
+            users_obj[str(cid)] = {
+                "subqueue": USER_SUBQUEUE.get(cid),
+                "notice": USER_NOTICE.get(cid, DEFAULT_NOTICE_MINUTES),
+            }
+        data = {"users": users_obj}
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[STATE] save_state failed: {e}")
+
+
+def register_user(chat_id: int) -> None:
+    ALL_USERS.add(chat_id)
+    USER_NOTICE.setdefault(chat_id, DEFAULT_NOTICE_MINUTES)
+    save_state()
+
+
+# =========================
+# UI
+# =========================
 def keyboard_choose_subqueue():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1.1", callback_data="sq:1.1"),
@@ -85,18 +160,13 @@ def keyboard_choose_subqueue():
     ])
 
 
-def keyboard_manage():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔁 Змінити підчергу", callback_data="change")],
-        [InlineKeyboardButton(text="❌ Скасувати сповіщення", callback_data="stop")],
-    ])
-
-# ---------------- FETCH ----------------
-
-
+# =========================
+# HTTP
+# =========================
 async def fetch_html() -> str:
-    async with aiohttp.ClientSession() as session:
-        async with session.get(URL, timeout=25) as r:
+    timeout = aiohttp.ClientTimeout(total=25)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(URL) as r:
             r.raise_for_status()
             return await r.text()
 
@@ -105,12 +175,10 @@ def _find_update_marker(full_text: str) -> str | None:
     m = UPDATE_RE.search(full_text)
     return m.group(0) if m else None
 
-# ---------------- PARSE (robust table -> matrix) ----------------
-
 
 def _html_table_to_matrix(table) -> list[list[str]]:
     """
-    Перетворює HTML-таблицю в матрицю з урахуванням rowspan/colspan.
+    Convert HTML table to matrix with rowspan/colspan support.
     """
     rows = table.find_all("tr")
     grid: list[list[str]] = []
@@ -157,159 +225,282 @@ def _html_table_to_matrix(table) -> list[list[str]]:
     return grid
 
 
-def parse_schedule_for_subqueue(html: str, subqueue: str) -> tuple[str | None, list[tuple[str, str]]]:
+def _parse_date_from_row(row: list[str]) -> str | None:
     """
-    Повертає (update_marker, intervals) для підчерги.
-    intervals — інтервали ВІДКЛЮЧЕННЯ.
+    Try find dd.mm.yyyy in any cell of row.
+    """
+    for cell in row:
+        if not cell:
+            continue
+        m = DATE_RE.search(cell)
+        if m:
+            return m.group(1)
+    return None
+
+
+def parse_all_schedules(html: str) -> tuple[str | None, dict[str, dict[str, list[tuple[str, str]]]]]:
+    """
+    Parse the big schedule table once and return schedules for all subqueues.
+    Output:
+      update_marker, schedules_by_subqueue
+      schedules_by_subqueue["5.1"] == {"07.02.2026": [(a,b)...], "08.02.2026": [...]}
     """
     soup = BeautifulSoup(html, "lxml")
     full_text = soup.get_text("\n", strip=True)
     update_marker = _find_update_marker(full_text)
 
+    # Find table which contains "Підчерга" and subqueues
     table = None
     for t in soup.find_all("table"):
         tt = t.get_text(" ", strip=True)
         if "Підчерга" in tt and "1.1" in tt and "6.2" in tt:
             table = t
             break
-
     if table is None:
-        return update_marker, []
+        return update_marker, {}
 
     matrix = _html_table_to_matrix(table)
+    if not matrix:
+        return update_marker, {}
 
+    # Identify header row and mapping subqueue -> column index
+    subqueues = [f"{i}.{j}" for i in range(1, 7) for j in (1, 2)]
+    col_map: dict[str, int] = {}
     header_row_idx = None
-    col_idx = None
+
     for r_i, row in enumerate(matrix):
-        if any(subqueue == (cell or "").strip() for cell in row):
+        found = []
+        for sq in subqueues:
+            for c_i, cell in enumerate(row):
+                if (cell or "").strip() == sq:
+                    found.append((sq, c_i))
+        if len(found) >= 6:  # heuristic: header row contains many subqueues
             header_row_idx = r_i
-            col_idx = next((i for i, cell in enumerate(row) if (cell or "").strip() == subqueue), None)
+            for sq, c_i in found:
+                col_map[sq] = c_i
             break
 
-    if header_row_idx is None or col_idx is None:
-        return update_marker, []
+    if header_row_idx is None or not col_map:
+        # fallback: search any row that has at least one subqueue and build map
+        for r_i, row in enumerate(matrix):
+            for sq in subqueues:
+                for c_i, cell in enumerate(row):
+                    if (cell or "").strip() == sq:
+                        header_row_idx = r_i
+                        col_map[sq] = c_i
+            if header_row_idx is not None and len(col_map) >= 6:
+                break
 
-    intervals: list[tuple[str, str]] = []
-    for r in matrix[header_row_idx + 1:]:
-        cell_text = (r[col_idx] or "").strip()
-        if not cell_text:
+    if header_row_idx is None or not col_map:
+        return update_marker, {}
+
+    schedules: dict[str, dict[str, list[tuple[str, str]]]] = {sq: {} for sq in col_map.keys()}
+
+    current_date: str | None = None
+    for row in matrix[header_row_idx + 1:]:
+        # detect date on this row
+        row_date = _parse_date_from_row(row)
+        if row_date:
+            current_date = row_date
+
+        if not current_date:
+            # If table starts without explicit date in first rows, skip
             continue
-        if "Очікується" in cell_text:
-            continue
-        for a, b in TIME_RANGE_RE.findall(cell_text):
-            intervals.append((a, b))
 
-    # прибираємо дублікати, зберігаючи порядок
-    uniq: list[tuple[str, str]] = []
-    seen = set()
-    for it in intervals:
-        if it not in seen:
-            uniq.append(it)
-            seen.add(it)
+        # For each subqueue, parse intervals from its cell
+        for sq, c_i in col_map.items():
+            if c_i >= len(row):
+                continue
+            cell_text = (row[c_i] or "").strip()
+            if not cell_text:
+                continue
+            if "Очікується" in cell_text:
+                continue
 
-    return update_marker, uniq
+            intervals = TIME_RANGE_RE.findall(cell_text)
+            if not intervals:
+                continue
+
+            day_map = schedules[sq].setdefault(current_date, [])
+            for a, b in intervals:
+                day_map.append((a, b))
+
+    # Deduplicate while preserving order, per day
+    for sq, day_map in schedules.items():
+        for d, intervals in list(day_map.items()):
+            uniq = []
+            seen = set()
+            for it in intervals:
+                if it not in seen:
+                    uniq.append(it)
+                    seen.add(it)
+            day_map[d] = uniq
+
+    # Remove empty schedules
+    schedules = {sq: dm for sq, dm in schedules.items() if any(dm.values())}
+
+    return update_marker, schedules
 
 
-def schedule_hash(intervals: list[tuple[str, str]]) -> str:
-    raw = "|".join([f"{a}-{b}" for a, b in intervals])
+def schedule_hash(schedule_by_day: dict[str, list[tuple[str, str]]]) -> str:
+    """
+    Hash schedule including dates to detect updates properly.
+    """
+    parts = []
+    for d in sorted(schedule_by_day.keys(), key=_date_sort_key):
+        parts.append(d)
+        for a, b in schedule_by_day[d]:
+            parts.append(f"{a}-{b}")
+    raw = "|".join(parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def format_schedule(subqueue: str, intervals: list[tuple[str, str]], update_marker: str | None) -> str:
-    today = now_kiev().strftime("%d.%m.%Y")
-    if not intervals:
-        msg = (
-            f"Графік (ВІДКЛЮЧЕННЯ) для {subqueue} на {today}:\n"
-            f"⚠️ Інтервали не знайдено (можливо “Очікується” або змінилась таблиця)."
-        )
-    else:
-        lines = [f"Графік (ВІДКЛЮЧЕННЯ) для {subqueue} на {today}:"]
-        for a, b in intervals:
-            lines.append(f"• {a}–{b}")
-        msg = "\n".join(lines)
+def _date_sort_key(d: str) -> tuple[int, int, int]:
+    # "dd.mm.yyyy"
+    try:
+        dd, mm, yy = d.split(".")
+        return (int(yy), int(mm), int(dd))
+    except Exception:
+        return (9999, 99, 99)
 
+
+def format_schedule_all_days(subqueue: str, schedule_by_day: dict[str, list[tuple[str, str]]], update_marker: str | None) -> str:
+    if not schedule_by_day:
+        msg = (
+            f"Графік (ВІДКЛЮЧЕННЯ) для {subqueue}:\n"
+            f"⚠️ Інтервали не знайдено (можливо на сайті ще “Очікується” або змінилась таблиця)."
+        )
+        if update_marker:
+            msg += f"\n\n{update_marker}"
+        return msg
+
+    lines = []
+    for d in sorted(schedule_by_day.keys(), key=_date_sort_key):
+        lines.append(f"{d} (ВІДКЛЮЧЕННЯ):")
+        for a, b in schedule_by_day[d]:
+            lines.append(f"• {a}–{b}")
+        lines.append("")  # blank line between days
+
+    msg = "\n".join(lines).strip()
     if update_marker:
         msg += f"\n\n{update_marker}"
     return msg
 
-# ---------------- TIME LOGIC ----------------
+
+def _dt_for_date(d_str: str, hhmm: str) -> datetime:
+    dd, mm, yy = d_str.split(".")
+    hh, mn = hhmm.split(":")
+    return datetime(int(yy), int(mm), int(dd), int(hh), int(mn), 0, tzinfo=TZ)
 
 
-def _dt_today(hhmm: str) -> datetime:
-    hh, mm = hhmm.split(":")
-    now = now_kiev()
-    return now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+def _interval_end_dt(d_str: str, hhmm: str) -> datetime:
+    # treat 23:59 as end of minute
+    dt = _dt_for_date(d_str, hhmm)
+    if hhmm == "23:59":
+        dt = dt.replace(second=59)
+    return dt
 
 
-def is_off_now(intervals: list[tuple[str, str]], now: datetime) -> bool:
+def is_off_now(schedule_by_day: dict[str, list[tuple[str, str]]], now: datetime) -> bool:
+    """
+    schedule_by_day: intervals of OFF times per day.
+    """
+    today_str = now.strftime("%d.%m.%Y")
+    intervals = schedule_by_day.get(today_str, [])
     for a, b in intervals:
-        st = _dt_today(a)
-        en = _dt_today(b)
-        if b == "23:59":
-            en = en.replace(second=59)
+        st = _dt_for_date(today_str, a)
+        en = _interval_end_dt(today_str, b)
         if st <= now <= en:
             return True
     return False
 
 
-def next_event(intervals: list[tuple[str, str]], now: datetime) -> tuple[datetime | None, str | None]:
-    # якщо зараз у відключенні -> найближче ON (кінець інтервалу)
-    for a, b in intervals:
-        st = _dt_today(a)
-        en = _dt_today(b)
-        if b == "23:59":
-            en = en.replace(second=59)
+def next_event(schedule_by_day: dict[str, list[tuple[str, str]]], now: datetime) -> tuple[datetime | None, str | None]:
+    """
+    Returns nearest event across available days:
+      ("OFF") start of an interval
+      ("ON")  end of an interval (restore)
+    Priority:
+      - if currently OFF today -> next ON = end of current interval
+      - else -> nearest future OFF across all days
+    """
+    today_str = now.strftime("%d.%m.%Y")
+
+    # If currently OFF today -> find current interval end (ON)
+    today_intervals = schedule_by_day.get(today_str, [])
+    for a, b in today_intervals:
+        st = _dt_for_date(today_str, a)
+        en = _interval_end_dt(today_str, b)
         if st <= now <= en:
             return en, "ON"
 
-    # якщо зараз світло є -> найближче OFF (початок наступного інтервалу)
-    future = []
-    for a, _b in intervals:
-        st = _dt_today(a)
-        if st > now:
-            future.append(st)
+    # Otherwise: find nearest future OFF start across all days available
+    candidates: list[datetime] = []
+    for d in schedule_by_day.keys():
+        for a, _b in schedule_by_day[d]:
+            st = _dt_for_date(d, a)
+            if st > now:
+                candidates.append(st)
 
-    if future:
-        return min(future), "OFF"
+    if candidates:
+        return min(candidates), "OFF"
 
     return None, None
 
-# ---------------- LOOPS ----------------
+
+# =========================
+# LOOPS
+# =========================
+_last_global_schedules: dict[str, dict[str, list[tuple[str, str]]]] = {}
+_last_global_update_marker: str | None = None
+
+
+async def process_site_once(send_updates: bool = True) -> None:
+    """
+    Fetch & parse schedules once; update user schedules; optionally send update messages.
+    """
+    global _last_global_schedules, _last_global_update_marker
+
+    try:
+        html = await fetch_html()
+        update_marker, schedules_all = parse_all_schedules(html)
+        _last_global_schedules = schedules_all
+        _last_global_update_marker = update_marker
+
+        for chat_id, subqueue in list(USER_SUBQUEUE.items()):
+            schedule_by_day = schedules_all.get(subqueue, {})
+            USER_LAST_SCHEDULE[chat_id] = schedule_by_day
+            USER_LAST_UPDATE_MARKER[chat_id] = update_marker
+
+            new_hash = schedule_hash(schedule_by_day)
+            old_hash = USER_LAST_HASH.get(chat_id)
+
+            if old_hash is None:
+                USER_LAST_HASH[chat_id] = new_hash
+                USER_NOTIFIED_KEYS.setdefault(chat_id, set())
+                continue
+
+            if send_updates and new_hash != old_hash:
+                USER_LAST_HASH[chat_id] = new_hash
+                USER_NOTIFIED_KEYS[chat_id] = set()
+
+                text = (
+                    f"🔄 Оновився графік по підчерзі {subqueue}\n\n"
+                    f"{format_schedule_all_days(subqueue, schedule_by_day, update_marker)}"
+                )
+                await bot.send_message(chat_id, text)
+
+    except Exception as e:
+        print(f"[WATCHER] process_site_once failed: {e}")
 
 
 async def site_watcher_loop():
     while True:
         try:
-            if not USER_SUBQUEUE:
-                await asyncio.sleep(SITE_CHECK_EVERY_SECONDS)
-                continue
-
-            html = await fetch_html()
-
-            for chat_id, subqueue in list(USER_SUBQUEUE.items()):
-                update_marker, intervals = parse_schedule_for_subqueue(html, subqueue)
-
-                new_hash = schedule_hash(intervals)
-                old_hash = USER_LAST_HASH.get(chat_id)
-
-                USER_LAST_SCHEDULE[chat_id] = intervals
-
-                if old_hash is not None and new_hash != old_hash:
-                    USER_LAST_HASH[chat_id] = new_hash
-                    USER_NOTIFIED_KEYS[chat_id] = set()
-
-                    await bot.send_message(
-                        chat_id,
-                        f"🔄 Оновився графік по підчерзі {subqueue}\n\n{format_schedule(subqueue, intervals, update_marker)}",
-                        reply_markup=keyboard_manage()
-                    )
-
-                if old_hash is None:
-                    USER_LAST_HASH[chat_id] = new_hash
-                    USER_NOTIFIED_KEYS.setdefault(chat_id, set())
-
-        except Exception:
-            pass
+            if USER_SUBQUEUE:
+                await process_site_once(send_updates=True)
+        except Exception as e:
+            print(f"[WATCHER] loop error: {e}")
 
         await asyncio.sleep(SITE_CHECK_EVERY_SECONDS)
 
@@ -317,196 +508,315 @@ async def site_watcher_loop():
 async def reminders_loop():
     while True:
         try:
-            now = now_kiev()
+            now = datetime.now(TZ)
+
             for chat_id, subqueue in list(USER_SUBQUEUE.items()):
-                intervals = USER_LAST_SCHEDULE.get(chat_id, [])
-                if not intervals:
+                schedule_by_day = USER_LAST_SCHEDULE.get(chat_id) or _last_global_schedules.get(subqueue, {})
+                if not schedule_by_day:
                     continue
+
+                notice = USER_NOTICE.get(chat_id, DEFAULT_NOTICE_MINUTES)
+                if notice not in ALLOWED_NOTICE:
+                    notice = DEFAULT_NOTICE_MINUTES
+                    USER_NOTICE[chat_id] = notice
 
                 notified = USER_NOTIFIED_KEYS.setdefault(chat_id, set())
                 day_key = now.strftime("%Y-%m-%d")
 
-                event_dt, event_type = next_event(intervals, now)
+                event_dt, event_type = next_event(schedule_by_day, now)
                 if not event_dt or not event_type:
                     continue
 
-                notify_time = event_dt - timedelta(minutes=NOTICE_MINUTES)
+                notify_time = event_dt - timedelta(minutes=notice)
 
                 if notify_time <= now < notify_time + timedelta(seconds=PREALERT_WINDOW_SECONDS):
-                    key = f"{day_key}|{subqueue}|{event_type}|{event_dt.strftime('%H:%M')}"
-                    if key not in notified:
-                        notified.add(key)
+                    key = f"{day_key}|{subqueue}|{event_type}|{event_dt.isoformat()}|{notice}"
+                    if key in notified:
+                        continue
+                    notified.add(key)
 
-                        if event_type == "OFF":
-                            text = f"⛔️ За {NOTICE_MINUTES} хв очікується ВІДКЛЮЧЕННЯ світла (о {event_dt.strftime('%H:%M')})"
-                        else:
-                            text = f"💡 За {NOTICE_MINUTES} хв очікується ВІДНОВЛЕННЯ світла (о {event_dt.strftime('%H:%M')})"
+                    hhmm = event_dt.strftime("%H:%M")
+                    if event_type == "OFF":
+                        text = f"⛔️ За {notice} хвилин можливе відключення світла (о {hhmm})"
+                    else:
+                        text = f"💡 За {notice} хвилин очікується відновлення світла (о {hhmm})"
 
-                        await bot.send_message(chat_id, text, reply_markup=keyboard_manage())
-        except Exception:
-            pass
+                    await bot.send_message(chat_id, text)
+
+        except Exception as e:
+            print(f"[REMINDERS] loop error: {e}")
 
         await asyncio.sleep(60)
 
-# ---------------- COMMANDS ----------------
 
-
+# =========================
+# COMMANDS (USERS)
+# =========================
 @dp.message(F.text == "/start")
 async def start(message: Message):
-    save_subscriber(message.chat.id)
+    chat_id = message.chat.id
+    register_user(chat_id)
+
     await message.answer(
         "Оберіть вашу підчергу.\n"
+        "Де дізнатись підчергу:\n"
+        "https://www.roe.vsei.ua/disconnections/\n\n"
         "👇 Натисни кнопку:",
         reply_markup=keyboard_choose_subqueue()
     )
 
 
+@dp.message(F.text == "/change")
+async def cmd_change(message: Message):
+    chat_id = message.chat.id
+    register_user(chat_id)
+    await message.answer("Ок, обери нову підчергу 👇", reply_markup=keyboard_choose_subqueue())
+
+
+@dp.message(F.text == "/stop")
+async def cmd_stop(message: Message):
+    chat_id = message.chat.id
+    register_user(chat_id)
+
+    USER_SUBQUEUE.pop(chat_id, None)
+    USER_LAST_HASH.pop(chat_id, None)
+    USER_LAST_SCHEDULE.pop(chat_id, None)
+    USER_LAST_UPDATE_MARKER.pop(chat_id, None)
+    USER_NOTIFIED_KEYS.pop(chat_id, None)
+
+    save_state()
+
+    await message.answer("Сповіщення вимкнув ✅\nЩоб знову увімкнути — натисни /start")
+
+
+@dp.message(F.text.startswith("/notice"))
+async def cmd_notice(message: Message):
+    chat_id = message.chat.id
+    register_user(chat_id)
+
+    parts = message.text.strip().split()
+    if len(parts) != 2:
+        cur = USER_NOTICE.get(chat_id, DEFAULT_NOTICE_MINUTES)
+        await message.answer(
+            "Налаштування попередження:\n"
+            "Використай: /notice 5 або /notice 10 або /notice 30\n"
+            f"Поточне значення: {cur} хв"
+        )
+        return
+
+    try:
+        val = int(parts[1])
+    except ValueError:
+        await message.answer("⚠️ Формат: /notice 5 або /notice 10 або /notice 30")
+        return
+
+    if val not in ALLOWED_NOTICE:
+        await message.answer("⚠️ Доступні значення: 5, 10, 30")
+        return
+
+    USER_NOTICE[chat_id] = val
+    save_state()
+    await message.answer(f"✅ Ок. Попередження за {val} хв до події.")
+
+
 @dp.message(F.text == "/schedule")
 async def cmd_schedule(message: Message):
-    save_subscriber(message.chat.id)
     chat_id = message.chat.id
-    if chat_id not in USER_SUBQUEUE:
+    register_user(chat_id)
+
+    subqueue = USER_SUBQUEUE.get(chat_id)
+    if not subqueue:
         await message.answer("⚠️ Спочатку обери підчергу через /start")
         return
-    subqueue = USER_SUBQUEUE[chat_id]
-    intervals = USER_LAST_SCHEDULE.get(chat_id, [])
-    await message.answer(format_schedule(subqueue, intervals, None), reply_markup=keyboard_manage())
+
+    # ensure we have recent data
+    schedule_by_day = USER_LAST_SCHEDULE.get(chat_id) or _last_global_schedules.get(subqueue, {})
+    update_marker = USER_LAST_UPDATE_MARKER.get(chat_id) or _last_global_update_marker
+
+    await message.answer(format_schedule_all_days(subqueue, schedule_by_day, update_marker))
 
 
 @dp.message(F.text == "/status")
 async def cmd_status(message: Message):
-    save_subscriber(message.chat.id)
     chat_id = message.chat.id
-    if chat_id not in USER_SUBQUEUE:
+    register_user(chat_id)
+
+    subqueue = USER_SUBQUEUE.get(chat_id)
+    if not subqueue:
         await message.answer("⚠️ Спочатку обери підчергу через /start")
         return
 
-    subqueue = USER_SUBQUEUE[chat_id]
-    intervals = USER_LAST_SCHEDULE.get(chat_id, [])
-    if not intervals:
-        await message.answer("Немає інтервалів (можливо 'Очікується').", reply_markup=keyboard_manage())
+    schedule_by_day = USER_LAST_SCHEDULE.get(chat_id) or _last_global_schedules.get(subqueue, {})
+    if not schedule_by_day:
+        await message.answer("⚠️ Зараз немає даних по графіку (можливо 'Очікується'). Спробуй /schedule пізніше.")
         return
 
-    now = now_kiev()
-    off = is_off_now(intervals, now)
-    ev_dt, ev_type = next_event(intervals, now)
+    now = datetime.now(TZ)
+    off = is_off_now(schedule_by_day, now)
+    ev_dt, ev_type = next_event(schedule_by_day, now)
 
     txt = "❌ ЗАРАЗ ВІДКЛЮЧЕННЯ" if off else "✅ ЗАРАЗ Є СВІТЛО"
     tail = ""
     if ev_dt and ev_type:
+        hhmm = ev_dt.strftime("%H:%M")
         if ev_type == "OFF":
-            tail = f"\nНайближче: відключення о {ev_dt.strftime('%H:%M')}"
+            tail = f"\nНайближче: відключення о {hhmm}"
         else:
-            tail = f"\nНайближче: відновлення о {ev_dt.strftime('%H:%M')}"
+            tail = f"\nНайближче: відновлення о {hhmm}"
 
-    await message.answer(f"{txt}\nПідчерга: {subqueue}{tail}", reply_markup=keyboard_manage())
-
-
-@dp.message(F.text == "/time")
-async def cmd_time(message: Message):
-    save_subscriber(message.chat.id)
-    await message.answer(f"Server time: {now_kiev().strftime('%d.%m.%Y %H:%M:%S')}")
+    await message.answer(f"{txt}\nПідчерга: {subqueue}{tail}")
 
 
-@dp.message(F.text.startswith("/broadcast"))
-async def cmd_broadcast(message: Message):
-    # тільки адмін
-    if ADMIN_ID == 0 or message.from_user.id != ADMIN_ID:
+@dp.message(F.text == "/next")
+async def cmd_next(message: Message):
+    chat_id = message.chat.id
+    register_user(chat_id)
+
+    subqueue = USER_SUBQUEUE.get(chat_id)
+    if not subqueue:
+        await message.answer("⚠️ Спочатку обери підчергу через /start")
         return
 
-    text = message.text.replace("/broadcast", "", 1).strip()
+    schedule_by_day = USER_LAST_SCHEDULE.get(chat_id) or _last_global_schedules.get(subqueue, {})
+    if not schedule_by_day:
+        await message.answer("⚠️ Немає даних по графіку (можливо 'Очікується').")
+        return
+
+    now = datetime.now(TZ)
+    ev_dt, ev_type = next_event(schedule_by_day, now)
+    if not ev_dt or not ev_type:
+        await message.answer("⚠️ Немає наступних подій у доступному графіку.")
+        return
+
+    hhmm = ev_dt.strftime("%H:%M")
+    dstr = ev_dt.strftime("%d.%m.%Y")
+    if ev_type == "OFF":
+        await message.answer(f"⛔️ Наступне відключення: {dstr} о {hhmm}")
+    else:
+        await message.answer(f"💡 Наступне відновлення: {dstr} о {hhmm}")
+
+
+# =========================
+# CALLBACKS (SUBQUEUE CHOICE)
+# =========================
+@dp.callback_query(F.data.startswith("sq:"))
+async def choose_subqueue(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    register_user(chat_id)
+
+    subqueue = cb.data.split(":", 1)[1].strip()
+    USER_SUBQUEUE[chat_id] = subqueue
+    USER_NOTIFIED_KEYS.setdefault(chat_id, set())
+    save_state()
+
+    await cb.answer()
+
+    try:
+        # Fetch latest schedules once (shared)
+        await process_site_once(send_updates=False)
+
+        schedule_by_day = _last_global_schedules.get(subqueue, {})
+        update_marker = _last_global_update_marker
+
+        USER_LAST_SCHEDULE[chat_id] = schedule_by_day
+        USER_LAST_UPDATE_MARKER[chat_id] = update_marker
+        USER_LAST_HASH[chat_id] = schedule_hash(schedule_by_day)
+        USER_NOTIFIED_KEYS[chat_id] = set()
+
+        notice = USER_NOTICE.get(chat_id, DEFAULT_NOTICE_MINUTES)
+
+        text = (
+            f"✅ Підчерга {subqueue} обрана\n"
+            f"⏱ Попередження: за {notice} хв\n\n"
+            f"{format_schedule_all_days(subqueue, schedule_by_day, update_marker)}\n\n"
+            f"Керування: /status /next /schedule /notice /change /stop"
+        )
+    except Exception as e:
+        print(f"[CHOOSE] failed: {e}")
+        text = (
+            f"✅ Підчерга {subqueue} обрана\n\n"
+            "⚠️ Не зміг зараз отримати графік із сайту. Спробуй ще раз через хвилину."
+        )
+
+    await cb.message.answer(text)
+
+
+# =========================
+# ADMIN COMMANDS
+# =========================
+def is_admin(message: Message) -> bool:
+    return ADMIN_ID != 0 and message.from_user and message.from_user.id == ADMIN_ID
+
+
+@dp.message(F.text.startswith("/bc"))
+async def admin_broadcast(message: Message):
+    if not is_admin(message):
+        return
+
+    # allow both "/bc text" and "/bc\ntext"
+    text = message.text.replace("/bc", "", 1).strip()
     if not text:
-        await message.answer("Формат: /broadcast твій текст")
+        await message.answer("Формат:\n/bc ваш текст повідомлення")
         return
 
-    subs = load_subscribers()
-    ok = 0
-    fail = 0
-
-    for chat_id in subs:
+    ok, fail = 0, 0
+    for cid in list(ALL_USERS):
         try:
-            await bot.send_message(chat_id, text)
+            await bot.send_message(cid, text)
             ok += 1
         except Exception:
             fail += 1
 
     await message.answer(f"Розсилка: ✅{ok} ❌{fail}")
 
-# ---------------- BUTTONS ----------------
 
-
-@dp.callback_query(F.data == "change")
-async def change_subqueue(cb: CallbackQuery):
-    save_subscriber(cb.message.chat.id)
-    await cb.answer()
-    await cb.message.answer("Ок, обери нову підчергу 👇", reply_markup=keyboard_choose_subqueue())
-
-
-@dp.callback_query(F.data == "stop")
-async def stop_notifications(cb: CallbackQuery):
-    save_subscriber(cb.message.chat.id)
-    chat_id = cb.message.chat.id
-    USER_SUBQUEUE.pop(chat_id, None)
-    USER_LAST_HASH.pop(chat_id, None)
-    USER_LAST_SCHEDULE.pop(chat_id, None)
-    USER_NOTIFIED_KEYS.pop(chat_id, None)
-
-    await cb.answer("Сповіщення вимкнено")
-    await cb.message.answer("Сповіщення вимкнув ✅\nЩоб знову увімкнути — натисни /start")
-
-
-@dp.callback_query(F.data.startswith("sq:"))
-async def choose(cb: CallbackQuery):
-    chat_id = cb.message.chat.id
-    save_subscriber(chat_id)
-
-    subqueue = cb.data.split(":", 1)[1]
-    USER_SUBQUEUE[chat_id] = subqueue
-    USER_NOTIFIED_KEYS.setdefault(chat_id, set())
-    await cb.answer()
-
-    try:
-        html = await fetch_html()
-        update_marker, intervals = parse_schedule_for_subqueue(html, subqueue)
-
-        USER_LAST_HASH[chat_id] = schedule_hash(intervals)
-        USER_LAST_SCHEDULE[chat_id] = intervals
-        USER_NOTIFIED_KEYS[chat_id] = set()
-
-        text = f"✅ Ви обрали підчергу {subqueue}\n\n{format_schedule(subqueue, intervals, update_marker)}"
-    except Exception:
-        text = (
-            f"✅ Ви обрали підчергу {subqueue}\n\n"
-            "⚠️ Не зміг зараз отримати графік із сайту. Спробуй ще раз через хвилину."
-        )
-
-    await cb.message.answer(text, reply_markup=keyboard_manage())
-
-# ---------------- TESTS ----------------
-
-
-@dp.message(F.text == "/test_off")
-async def test_off(message: Message):
-    if message.chat.id not in USER_SUBQUEUE:
-        await message.answer("⚠️ Спочатку обери підчергу через /start")
+@dp.message(F.text == "/stats")
+async def admin_stats(message: Message):
+    if not is_admin(message):
         return
-    await message.answer("⛔️ За 10 хв очікується ВІДКЛЮЧЕННЯ світла (тест)", reply_markup=keyboard_manage())
+
+    total = len(ALL_USERS)
+    active = len(USER_SUBQUEUE)
+    await message.answer(
+        f"📊 Статистика:\n"
+        f"👥 Всього користувачів: {total}\n"
+        f"🔔 З активними сповіщеннями: {active}"
+    )
 
 
-@dp.message(F.text == "/test_on")
-async def test_on(message: Message):
-    if message.chat.id not in USER_SUBQUEUE:
-        await message.answer("⚠️ Спочатку обери підчергу через /start")
+@dp.message(F.text == "/force")
+async def admin_force(message: Message):
+    if not is_admin(message):
         return
-    await message.answer("💡 За 10 хв очікується ВІДНОВЛЕННЯ світла (тест)", reply_markup=keyboard_manage())
+
+    await message.answer("⏳ Ок, перевіряю сайт зараз...")
+    await process_site_once(send_updates=True)
+    await message.answer("✅ Готово.")
 
 
-# ---------------- MAIN ----------------
+@dp.message(F.text == "/time")
+async def admin_time(message: Message):
+    if not is_admin(message):
+        return
+    now = datetime.now(TZ)
+    await message.answer(f"Server time: {now.strftime('%d.%m.%Y %H:%M:%S')} (Europe/Kyiv)")
 
 
+# =========================
+# MAIN
+# =========================
 async def main():
+    load_state()
+
+    # On start: try initial fetch (non-fatal)
+    try:
+        await process_site_once(send_updates=False)
+    except Exception as e:
+        print(f"[INIT] initial fetch failed: {e}")
+
     asyncio.create_task(site_watcher_loop())
     asyncio.create_task(reminders_loop())
+
     await dp.start_polling(bot)
 
 
