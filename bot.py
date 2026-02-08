@@ -3,7 +3,7 @@ import os
 import re
 import json
 import hashlib
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -85,13 +85,6 @@ def load_state() -> None:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # Basic shape:
-        # {
-        #   "users": {
-        #       "123": {"subqueue": "5.1", "notice": 10},
-        #       ...
-        #   }
-        # }
         users = data.get("users", {})
         for chat_id_str, u in users.items():
             try:
@@ -157,6 +150,23 @@ def keyboard_choose_subqueue():
          InlineKeyboardButton(text="5.2", callback_data="sq:5.2")],
         [InlineKeyboardButton(text="6.1", callback_data="sq:6.1"),
          InlineKeyboardButton(text="6.2", callback_data="sq:6.2")],
+    ])
+
+
+def keyboard_notice(cur: int | None = None):
+    """
+    Inline keyboard for choosing notice minutes.
+    """
+    def btn(label: str, val: int):
+        mark = " ✅" if cur == val else ""
+        return InlineKeyboardButton(text=f"{label}{mark}", callback_data=f"notice:{val}")
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            btn("⏱ 5 хв", 5),
+            btn("⏱ 10 хв", 10),
+            btn("⏱ 30 хв", 30),
+        ]
     ])
 
 
@@ -281,7 +291,6 @@ def parse_all_schedules(html: str) -> tuple[str | None, dict[str, dict[str, list
             break
 
     if header_row_idx is None or not col_map:
-        # fallback: search any row that has at least one subqueue and build map
         for r_i, row in enumerate(matrix):
             for sq in subqueues:
                 for c_i, cell in enumerate(row):
@@ -298,16 +307,13 @@ def parse_all_schedules(html: str) -> tuple[str | None, dict[str, dict[str, list
 
     current_date: str | None = None
     for row in matrix[header_row_idx + 1:]:
-        # detect date on this row
         row_date = _parse_date_from_row(row)
         if row_date:
             current_date = row_date
 
         if not current_date:
-            # If table starts without explicit date in first rows, skip
             continue
 
-        # For each subqueue, parse intervals from its cell
         for sq, c_i in col_map.items():
             if c_i >= len(row):
                 continue
@@ -336,16 +342,19 @@ def parse_all_schedules(html: str) -> tuple[str | None, dict[str, dict[str, list
                     seen.add(it)
             day_map[d] = uniq
 
-    # Remove empty schedules
     schedules = {sq: dm for sq, dm in schedules.items() if any(dm.values())}
-
     return update_marker, schedules
 
 
+def _date_sort_key(d: str) -> tuple[int, int, int]:
+    try:
+        dd, mm, yy = d.split(".")
+        return (int(yy), int(mm), int(dd))
+    except Exception:
+        return (9999, 99, 99)
+
+
 def schedule_hash(schedule_by_day: dict[str, list[tuple[str, str]]]) -> str:
-    """
-    Hash schedule including dates to detect updates properly.
-    """
     parts = []
     for d in sorted(schedule_by_day.keys(), key=_date_sort_key):
         parts.append(d)
@@ -353,15 +362,6 @@ def schedule_hash(schedule_by_day: dict[str, list[tuple[str, str]]]) -> str:
             parts.append(f"{a}-{b}")
     raw = "|".join(parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _date_sort_key(d: str) -> tuple[int, int, int]:
-    # "dd.mm.yyyy"
-    try:
-        dd, mm, yy = d.split(".")
-        return (int(yy), int(mm), int(dd))
-    except Exception:
-        return (9999, 99, 99)
 
 
 def format_schedule_all_days(subqueue: str, schedule_by_day: dict[str, list[tuple[str, str]]], update_marker: str | None) -> str:
@@ -379,7 +379,7 @@ def format_schedule_all_days(subqueue: str, schedule_by_day: dict[str, list[tupl
         lines.append(f"{d} (ВІДКЛЮЧЕННЯ):")
         for a, b in schedule_by_day[d]:
             lines.append(f"• {a}–{b}")
-        lines.append("")  # blank line between days
+        lines.append("")
 
     msg = "\n".join(lines).strip()
     if update_marker:
@@ -394,7 +394,6 @@ def _dt_for_date(d_str: str, hhmm: str) -> datetime:
 
 
 def _interval_end_dt(d_str: str, hhmm: str) -> datetime:
-    # treat 23:59 as end of minute
     dt = _dt_for_date(d_str, hhmm)
     if hhmm == "23:59":
         dt = dt.replace(second=59)
@@ -402,9 +401,6 @@ def _interval_end_dt(d_str: str, hhmm: str) -> datetime:
 
 
 def is_off_now(schedule_by_day: dict[str, list[tuple[str, str]]], now: datetime) -> bool:
-    """
-    schedule_by_day: intervals of OFF times per day.
-    """
     today_str = now.strftime("%d.%m.%Y")
     intervals = schedule_by_day.get(today_str, [])
     for a, b in intervals:
@@ -416,17 +412,9 @@ def is_off_now(schedule_by_day: dict[str, list[tuple[str, str]]], now: datetime)
 
 
 def next_event(schedule_by_day: dict[str, list[tuple[str, str]]], now: datetime) -> tuple[datetime | None, str | None]:
-    """
-    Returns nearest event across available days:
-      ("OFF") start of an interval
-      ("ON")  end of an interval (restore)
-    Priority:
-      - if currently OFF today -> next ON = end of current interval
-      - else -> nearest future OFF across all days
-    """
     today_str = now.strftime("%d.%m.%Y")
 
-    # If currently OFF today -> find current interval end (ON)
+    # If currently OFF today -> next ON at end of current interval
     today_intervals = schedule_by_day.get(today_str, [])
     for a, b in today_intervals:
         st = _dt_for_date(today_str, a)
@@ -434,7 +422,7 @@ def next_event(schedule_by_day: dict[str, list[tuple[str, str]]], now: datetime)
         if st <= now <= en:
             return en, "ON"
 
-    # Otherwise: find nearest future OFF start across all days available
+    # Else -> nearest future OFF start across all available days
     candidates: list[datetime] = []
     for d in schedule_by_day.keys():
         for a, _b in schedule_by_day[d]:
@@ -456,9 +444,6 @@ _last_global_update_marker: str | None = None
 
 
 async def process_site_once(send_updates: bool = True) -> None:
-    """
-    Fetch & parse schedules once; update user schedules; optionally send update messages.
-    """
     global _last_global_schedules, _last_global_update_marker
 
     try:
@@ -589,34 +574,19 @@ async def cmd_stop(message: Message):
     await message.answer("Сповіщення вимкнув ✅\nЩоб знову увімкнути — натисни /start")
 
 
-@dp.message(F.text.startswith("/notice"))
+@dp.message(F.text == "/notice")
 async def cmd_notice(message: Message):
+    """
+    User-friendly notice settings: show buttons 5/10/30.
+    """
     chat_id = message.chat.id
     register_user(chat_id)
 
-    parts = message.text.strip().split()
-    if len(parts) != 2:
-        cur = USER_NOTICE.get(chat_id, DEFAULT_NOTICE_MINUTES)
-        await message.answer(
-            "Налаштування попередження:\n"
-            "Використай: /notice 5 або /notice 10 або /notice 30\n"
-            f"Поточне значення: {cur} хв"
-        )
-        return
-
-    try:
-        val = int(parts[1])
-    except ValueError:
-        await message.answer("⚠️ Формат: /notice 5 або /notice 10 або /notice 30")
-        return
-
-    if val not in ALLOWED_NOTICE:
-        await message.answer("⚠️ Доступні значення: 5, 10, 30")
-        return
-
-    USER_NOTICE[chat_id] = val
-    save_state()
-    await message.answer(f"✅ Ок. Попередження за {val} хв до події.")
+    cur = USER_NOTICE.get(chat_id, DEFAULT_NOTICE_MINUTES)
+    await message.answer(
+        f"Оберіть за скільки хвилин попереджати.\nПоточне: {cur} хв",
+        reply_markup=keyboard_notice(cur)
+    )
 
 
 @dp.message(F.text == "/schedule")
@@ -629,7 +599,6 @@ async def cmd_schedule(message: Message):
         await message.answer("⚠️ Спочатку обери підчергу через /start")
         return
 
-    # ensure we have recent data
     schedule_by_day = USER_LAST_SCHEDULE.get(chat_id) or _last_global_schedules.get(subqueue, {})
     update_marker = USER_LAST_UPDATE_MARKER.get(chat_id) or _last_global_update_marker
 
@@ -697,7 +666,7 @@ async def cmd_next(message: Message):
 
 
 # =========================
-# CALLBACKS (SUBQUEUE CHOICE)
+# CALLBACKS
 # =========================
 @dp.callback_query(F.data.startswith("sq:"))
 async def choose_subqueue(cb: CallbackQuery):
@@ -712,7 +681,6 @@ async def choose_subqueue(cb: CallbackQuery):
     await cb.answer()
 
     try:
-        # Fetch latest schedules once (shared)
         await process_site_once(send_updates=False)
 
         schedule_by_day = _last_global_schedules.get(subqueue, {})
@@ -728,8 +696,7 @@ async def choose_subqueue(cb: CallbackQuery):
         text = (
             f"✅ Підчерга {subqueue} обрана\n"
             f"⏱ Попередження: за {notice} хв\n\n"
-            f"{format_schedule_all_days(subqueue, schedule_by_day, update_marker)}\n\n"
-            
+            f"{format_schedule_all_days(subqueue, schedule_by_day, update_marker)}"
         )
     except Exception as e:
         print(f"[CHOOSE] failed: {e}")
@@ -739,6 +706,28 @@ async def choose_subqueue(cb: CallbackQuery):
         )
 
     await cb.message.answer(text)
+
+
+@dp.callback_query(F.data.startswith("notice:"))
+async def choose_notice(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    register_user(chat_id)
+
+    try:
+        val = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        await cb.answer("Помилка", show_alert=True)
+        return
+
+    if val not in ALLOWED_NOTICE:
+        await cb.answer("Доступно: 5/10/30", show_alert=True)
+        return
+
+    USER_NOTICE[chat_id] = val
+    save_state()
+
+    await cb.answer("Збережено ✅")
+    await cb.message.answer(f"✅ Ок. Попереджатиму за {val} хв до події.")
 
 
 # =========================
@@ -753,7 +742,6 @@ async def admin_broadcast(message: Message):
     if not is_admin(message):
         return
 
-    # allow both "/bc text" and "/bc\ntext"
     text = message.text.replace("/bc", "", 1).strip()
     if not text:
         await message.answer("Формат:\n/bc ваш текст повідомлення")
@@ -808,7 +796,7 @@ async def admin_time(message: Message):
 async def main():
     load_state()
 
-    # On start: try initial fetch (non-fatal)
+    # Initial fetch (non-fatal)
     try:
         await process_site_once(send_updates=False)
     except Exception as e:
@@ -822,4 +810,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
