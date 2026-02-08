@@ -29,7 +29,7 @@ PREALERT_WINDOW_SECONDS = 120           # 2 хв вікно
 DEFAULT_NOTICE_MINUTES = 10
 ALLOWED_NOTICE = {5, 10, 30}
 
-STATE_FILE = "state.json"               # простий json в робочій директорії
+STATE_FILE = "state.json"               # json state
 
 # Парсинг
 TIME_RANGE_RE = re.compile(r"(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})")
@@ -48,36 +48,25 @@ dp = Dispatcher()
 # =========================
 # IN-MEMORY STATE
 # =========================
-# chat_id -> subqueue
-USER_SUBQUEUE: dict[int, str] = {}
+USER_SUBQUEUE: dict[int, str] = {}  # chat_id -> subqueue
+USER_NOTICE: dict[int, int] = {}    # chat_id -> notice minutes
 
-# chat_id -> notice minutes
-USER_NOTICE: dict[int, int] = {}
+USER_LAST_HASH: dict[int, str] = {}  # chat_id -> hash schedule
+USER_LAST_SCHEDULE: dict[int, dict[str, list[tuple[str, str]]]] = {}  # chat_id -> {date: [(a,b)]}
+USER_LAST_UPDATE_MARKER: dict[int, str | None] = {}  # chat_id -> "Оновлено: ..."
 
-# chat_id -> last hash of schedule (for update detection)
-USER_LAST_HASH: dict[int, str] = {}
+USER_NOTIFIED_KEYS: dict[int, set[str]] = {}  # chat_id -> set(keys)
+ALL_USERS: set[int] = set()                   # known users for broadcast/stats
 
-# chat_id -> last parsed schedule for chosen subqueue: { "dd.mm.yyyy": [(a,b), ...], ... }
-USER_LAST_SCHEDULE: dict[int, dict[str, list[tuple[str, str]]]] = {}
-
-# chat_id -> last "Оновлено: ..."
-USER_LAST_UPDATE_MARKER: dict[int, str | None] = {}
-
-# chat_id -> set of notification keys (avoid duplicates)
-USER_NOTIFIED_KEYS: dict[int, set[str]] = {}
-
-# all known users (for broadcast / stats)
-ALL_USERS: set[int] = set()
+# cached last global parse
+_last_global_schedules: dict[str, dict[str, list[tuple[str, str]]]] = {}
+_last_global_update_marker: str | None = None
 
 
 # =========================
-# PERSISTENCE (JSON)
+# PERSISTENCE
 # =========================
 def load_state() -> None:
-    """
-    Load state from STATE_FILE if possible.
-    If file missing or invalid -> ignore (bot still works).
-    """
     global USER_SUBQUEUE, USER_NOTICE, ALL_USERS
     try:
         if not os.path.exists(STATE_FILE):
@@ -109,10 +98,6 @@ def load_state() -> None:
 
 
 def save_state() -> None:
-    """
-    Save minimal state for users: subqueue + notice.
-    If save fails -> ignore (bot still works).
-    """
     try:
         users_obj: dict[str, dict] = {}
         for cid in ALL_USERS:
@@ -134,7 +119,7 @@ def register_user(chat_id: int) -> None:
 
 
 # =========================
-# UI
+# UI (KEYBOARDS)
 # =========================
 def keyboard_choose_subqueue():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -153,25 +138,33 @@ def keyboard_choose_subqueue():
     ])
 
 
-def keyboard_notice(cur: int | None = None):
-    """
-    Inline keyboard for choosing notice minutes.
-    """
-    def btn(label: str, val: int):
-        mark = " ✅" if cur == val else ""
-        return InlineKeyboardButton(text=f"{label}{mark}", callback_data=f"notice:{val}")
-
+def keyboard_main():
+    # кнопки керування (без /next та /schedule)
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            btn("⏱ 5 хв", 5),
-            btn("⏱ 10 хв", 10),
-            btn("⏱ 30 хв", 30),
-        ]
+        [InlineKeyboardButton(text="🔴 Поточний стан", callback_data="main:status")],
+        [InlineKeyboardButton(text="🔔 Налаштувати сповіщення", callback_data="main:notice")],
+        [InlineKeyboardButton(text="🔁 Змінити підчергу", callback_data="main:change"),
+         InlineKeyboardButton(text="❌ Вимкнути сповіщення", callback_data="main:stop")],
     ])
 
 
+def keyboard_notice(cur: int | None = None):
+    def btn(val: int):
+        mark = " ✅" if cur == val else ""
+        return InlineKeyboardButton(text=f"⏱ {val} хв{mark}", callback_data=f"notice:{val}")
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn(5), btn(10), btn(30)],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="main:back")],
+    ])
+
+
+async def send_main_menu(chat_id: int, text: str):
+    await bot.send_message(chat_id, text, reply_markup=keyboard_main())
+
+
 # =========================
-# HTTP
+# HTTP / PARSING
 # =========================
 async def fetch_html() -> str:
     timeout = aiohttp.ClientTimeout(total=25)
@@ -187,9 +180,6 @@ def _find_update_marker(full_text: str) -> str | None:
 
 
 def _html_table_to_matrix(table) -> list[list[str]]:
-    """
-    Convert HTML table to matrix with rowspan/colspan support.
-    """
     rows = table.find_all("tr")
     grid: list[list[str]] = []
     span_map: dict[tuple[int, int], dict] = {}
@@ -236,9 +226,6 @@ def _html_table_to_matrix(table) -> list[list[str]]:
 
 
 def _parse_date_from_row(row: list[str]) -> str | None:
-    """
-    Try find dd.mm.yyyy in any cell of row.
-    """
     for cell in row:
         if not cell:
             continue
@@ -249,17 +236,10 @@ def _parse_date_from_row(row: list[str]) -> str | None:
 
 
 def parse_all_schedules(html: str) -> tuple[str | None, dict[str, dict[str, list[tuple[str, str]]]]]:
-    """
-    Parse the big schedule table once and return schedules for all subqueues.
-    Output:
-      update_marker, schedules_by_subqueue
-      schedules_by_subqueue["5.1"] == {"07.02.2026": [(a,b)...], "08.02.2026": [...]}
-    """
     soup = BeautifulSoup(html, "lxml")
     full_text = soup.get_text("\n", strip=True)
     update_marker = _find_update_marker(full_text)
 
-    # Find table which contains "Підчерга" and subqueues
     table = None
     for t in soup.find_all("table"):
         tt = t.get_text(" ", strip=True)
@@ -273,32 +253,22 @@ def parse_all_schedules(html: str) -> tuple[str | None, dict[str, dict[str, list
     if not matrix:
         return update_marker, {}
 
-    # Identify header row and mapping subqueue -> column index
     subqueues = [f"{i}.{j}" for i in range(1, 7) for j in (1, 2)]
     col_map: dict[str, int] = {}
     header_row_idx = None
 
+    # шукаємо рядок з підчергами
     for r_i, row in enumerate(matrix):
         found = []
         for sq in subqueues:
             for c_i, cell in enumerate(row):
                 if (cell or "").strip() == sq:
                     found.append((sq, c_i))
-        if len(found) >= 6:  # heuristic: header row contains many subqueues
+        if len(found) >= 6:
             header_row_idx = r_i
             for sq, c_i in found:
                 col_map[sq] = c_i
             break
-
-    if header_row_idx is None or not col_map:
-        for r_i, row in enumerate(matrix):
-            for sq in subqueues:
-                for c_i, cell in enumerate(row):
-                    if (cell or "").strip() == sq:
-                        header_row_idx = r_i
-                        col_map[sq] = c_i
-            if header_row_idx is not None and len(col_map) >= 6:
-                break
 
     if header_row_idx is None or not col_map:
         return update_marker, {}
@@ -331,7 +301,7 @@ def parse_all_schedules(html: str) -> tuple[str | None, dict[str, dict[str, list
             for a, b in intervals:
                 day_map.append((a, b))
 
-    # Deduplicate while preserving order, per day
+    # дедуп по днях
     for sq, day_map in schedules.items():
         for d, intervals in list(day_map.items()):
             uniq = []
@@ -368,7 +338,7 @@ def format_schedule_all_days(subqueue: str, schedule_by_day: dict[str, list[tupl
     if not schedule_by_day:
         msg = (
             f"Графік (ВІДКЛЮЧЕННЯ) для {subqueue}:\n"
-            f"⚠️ Інтервали не знайдено (можливо на сайті ще “Очікується” або змінилась таблиця)."
+            f"⚠️ Інтервали не знайдено (можливо “Очікується” або змінилась таблиця)."
         )
         if update_marker:
             msg += f"\n\n{update_marker}"
@@ -414,7 +384,7 @@ def is_off_now(schedule_by_day: dict[str, list[tuple[str, str]]], now: datetime)
 def next_event(schedule_by_day: dict[str, list[tuple[str, str]]], now: datetime) -> tuple[datetime | None, str | None]:
     today_str = now.strftime("%d.%m.%Y")
 
-    # If currently OFF today -> next ON at end of current interval
+    # якщо зараз OFF - найближче ON (кінець поточного інтервалу)
     today_intervals = schedule_by_day.get(today_str, [])
     for a, b in today_intervals:
         st = _dt_for_date(today_str, a)
@@ -422,7 +392,7 @@ def next_event(schedule_by_day: dict[str, list[tuple[str, str]]], now: datetime)
         if st <= now <= en:
             return en, "ON"
 
-    # Else -> nearest future OFF start across all available days
+    # інакше шукаємо найближчий старт OFF у майбутньому (по всіх днях)
     candidates: list[datetime] = []
     for d in schedule_by_day.keys():
         for a, _b in schedule_by_day[d]:
@@ -439,44 +409,37 @@ def next_event(schedule_by_day: dict[str, list[tuple[str, str]]], now: datetime)
 # =========================
 # LOOPS
 # =========================
-_last_global_schedules: dict[str, dict[str, list[tuple[str, str]]]] = {}
-_last_global_update_marker: str | None = None
-
-
 async def process_site_once(send_updates: bool = True) -> None:
     global _last_global_schedules, _last_global_update_marker
 
-    try:
-        html = await fetch_html()
-        update_marker, schedules_all = parse_all_schedules(html)
-        _last_global_schedules = schedules_all
-        _last_global_update_marker = update_marker
+    html = await fetch_html()
+    update_marker, schedules_all = parse_all_schedules(html)
 
-        for chat_id, subqueue in list(USER_SUBQUEUE.items()):
-            schedule_by_day = schedules_all.get(subqueue, {})
-            USER_LAST_SCHEDULE[chat_id] = schedule_by_day
-            USER_LAST_UPDATE_MARKER[chat_id] = update_marker
+    _last_global_schedules = schedules_all
+    _last_global_update_marker = update_marker
 
-            new_hash = schedule_hash(schedule_by_day)
-            old_hash = USER_LAST_HASH.get(chat_id)
+    for chat_id, subqueue in list(USER_SUBQUEUE.items()):
+        schedule_by_day = schedules_all.get(subqueue, {})
+        USER_LAST_SCHEDULE[chat_id] = schedule_by_day
+        USER_LAST_UPDATE_MARKER[chat_id] = update_marker
 
-            if old_hash is None:
-                USER_LAST_HASH[chat_id] = new_hash
-                USER_NOTIFIED_KEYS.setdefault(chat_id, set())
-                continue
+        new_hash = schedule_hash(schedule_by_day)
+        old_hash = USER_LAST_HASH.get(chat_id)
 
-            if send_updates and new_hash != old_hash:
-                USER_LAST_HASH[chat_id] = new_hash
-                USER_NOTIFIED_KEYS[chat_id] = set()
+        if old_hash is None:
+            USER_LAST_HASH[chat_id] = new_hash
+            USER_NOTIFIED_KEYS.setdefault(chat_id, set())
+            continue
 
-                text = (
-                    f"🔄 Оновився графік по підчерзі {subqueue}\n\n"
-                    f"{format_schedule_all_days(subqueue, schedule_by_day, update_marker)}"
-                )
-                await bot.send_message(chat_id, text)
+        if send_updates and new_hash != old_hash:
+            USER_LAST_HASH[chat_id] = new_hash
+            USER_NOTIFIED_KEYS[chat_id] = set()
 
-    except Exception as e:
-        print(f"[WATCHER] process_site_once failed: {e}")
+            text = (
+                f"🔄 Оновився графік по підчерзі {subqueue}\n\n"
+                f"{format_schedule_all_days(subqueue, schedule_by_day, update_marker)}"
+            )
+            await send_main_menu(chat_id, text)
 
 
 async def site_watcher_loop():
@@ -486,7 +449,6 @@ async def site_watcher_loop():
                 await process_site_once(send_updates=True)
         except Exception as e:
             print(f"[WATCHER] loop error: {e}")
-
         await asyncio.sleep(SITE_CHECK_EVERY_SECONDS)
 
 
@@ -535,7 +497,7 @@ async def reminders_loop():
 
 
 # =========================
-# COMMANDS (USERS)
+# USER COMMANDS
 # =========================
 @dp.message(F.text == "/start")
 async def start(message: Message):
@@ -544,10 +506,28 @@ async def start(message: Message):
 
     await message.answer(
         "Оберіть вашу підчергу.\n"
-        "Де дізнатись підчергу:\n"
-        "https://www.roe.vsei.ua/disconnections/\n\n"
         "👇 Натисни кнопку:",
         reply_markup=keyboard_choose_subqueue()
+    )
+
+
+@dp.message(F.text == "/status")
+async def cmd_status(message: Message):
+    chat_id = message.chat.id
+    register_user(chat_id)
+    text = build_status_text(chat_id)
+    await send_main_menu(chat_id, text)
+
+
+@dp.message(F.text == "/notice")
+async def cmd_notice(message: Message):
+    chat_id = message.chat.id
+    register_user(chat_id)
+
+    cur = USER_NOTICE.get(chat_id, DEFAULT_NOTICE_MINUTES)
+    await message.answer(
+        f"Оберіть за скільки хвилин попереджати.\nПоточне: {cur} хв",
+        reply_markup=keyboard_notice(cur)
     )
 
 
@@ -570,25 +550,10 @@ async def cmd_stop(message: Message):
     USER_NOTIFIED_KEYS.pop(chat_id, None)
 
     save_state()
-
     await message.answer("Сповіщення вимкнув ✅\nЩоб знову увімкнути — натисни /start")
 
 
-@dp.message(F.text == "/notice")
-async def cmd_notice(message: Message):
-    """
-    User-friendly notice settings: show buttons 5/10/30.
-    """
-    chat_id = message.chat.id
-    register_user(chat_id)
-
-    cur = USER_NOTICE.get(chat_id, DEFAULT_NOTICE_MINUTES)
-    await message.answer(
-        f"Оберіть за скільки хвилин попереджати.\nПоточне: {cur} хв",
-        reply_markup=keyboard_notice(cur)
-    )
-
-
+# залишаємо технічні команди (без кнопок)
 @dp.message(F.text == "/schedule")
 async def cmd_schedule(message: Message):
     chat_id = message.chat.id
@@ -601,39 +566,7 @@ async def cmd_schedule(message: Message):
 
     schedule_by_day = USER_LAST_SCHEDULE.get(chat_id) or _last_global_schedules.get(subqueue, {})
     update_marker = USER_LAST_UPDATE_MARKER.get(chat_id) or _last_global_update_marker
-
-    await message.answer(format_schedule_all_days(subqueue, schedule_by_day, update_marker))
-
-
-@dp.message(F.text == "/status")
-async def cmd_status(message: Message):
-    chat_id = message.chat.id
-    register_user(chat_id)
-
-    subqueue = USER_SUBQUEUE.get(chat_id)
-    if not subqueue:
-        await message.answer("⚠️ Спочатку обери підчергу через /start")
-        return
-
-    schedule_by_day = USER_LAST_SCHEDULE.get(chat_id) or _last_global_schedules.get(subqueue, {})
-    if not schedule_by_day:
-        await message.answer("⚠️ Зараз немає даних по графіку (можливо 'Очікується'). Спробуй /schedule пізніше.")
-        return
-
-    now = datetime.now(TZ)
-    off = is_off_now(schedule_by_day, now)
-    ev_dt, ev_type = next_event(schedule_by_day, now)
-
-    txt = "❌ ЗАРАЗ ВІДКЛЮЧЕННЯ" if off else "✅ ЗАРАЗ Є СВІТЛО"
-    tail = ""
-    if ev_dt and ev_type:
-        hhmm = ev_dt.strftime("%H:%M")
-        if ev_type == "OFF":
-            tail = f"\nНайближче: відключення о {hhmm}"
-        else:
-            tail = f"\nНайближче: відновлення о {hhmm}"
-
-    await message.answer(f"{txt}\nПідчерга: {subqueue}{tail}")
+    await send_main_menu(chat_id, format_schedule_all_days(subqueue, schedule_by_day, update_marker))
 
 
 @dp.message(F.text == "/next")
@@ -660,9 +593,34 @@ async def cmd_next(message: Message):
     hhmm = ev_dt.strftime("%H:%M")
     dstr = ev_dt.strftime("%d.%m.%Y")
     if ev_type == "OFF":
-        await message.answer(f"⛔️ Наступне відключення: {dstr} о {hhmm}")
+        await send_main_menu(chat_id, f"⛔️ Наступне відключення: {dstr} о {hhmm}")
     else:
-        await message.answer(f"💡 Наступне відновлення: {dstr} о {hhmm}")
+        await send_main_menu(chat_id, f"💡 Наступне відновлення: {dstr} о {hhmm}")
+
+
+def build_status_text(chat_id: int) -> str:
+    subqueue = USER_SUBQUEUE.get(chat_id)
+    if not subqueue:
+        return "⚠️ Спочатку обери підчергу через /start"
+
+    schedule_by_day = USER_LAST_SCHEDULE.get(chat_id) or _last_global_schedules.get(subqueue, {})
+    if not schedule_by_day:
+        return "⚠️ Зараз немає даних по графіку (можливо 'Очікується'). Спробуй /schedule пізніше."
+
+    now = datetime.now(TZ)
+    off = is_off_now(schedule_by_day, now)
+    ev_dt, ev_type = next_event(schedule_by_day, now)
+
+    txt = "❌ ЗАРАЗ ВІДКЛЮЧЕННЯ" if off else "✅ ЗАРАЗ Є СВІТЛО"
+    tail = ""
+    if ev_dt and ev_type:
+        hhmm = ev_dt.strftime("%H:%M")
+        if ev_type == "OFF":
+            tail = f"\nНайближче: відключення о {hhmm}"
+        else:
+            tail = f"\nНайближче: відновлення о {hhmm}"
+
+    return f"{txt}\nПідчерга: {subqueue}{tail}"
 
 
 # =========================
@@ -681,6 +639,7 @@ async def choose_subqueue(cb: CallbackQuery):
     await cb.answer()
 
     try:
+        # оновити кеш з сайту (без пушів)
         await process_site_once(send_updates=False)
 
         schedule_by_day = _last_global_schedules.get(subqueue, {})
@@ -698,14 +657,50 @@ async def choose_subqueue(cb: CallbackQuery):
             f"⏱ Попередження: за {notice} хв\n\n"
             f"{format_schedule_all_days(subqueue, schedule_by_day, update_marker)}"
         )
+        await send_main_menu(chat_id, text)
+
     except Exception as e:
         print(f"[CHOOSE] failed: {e}")
-        text = (
-            f"✅ Підчерга {subqueue} обрана\n\n"
-            "⚠️ Не зміг зараз отримати графік із сайту. Спробуй ще раз через хвилину."
+        await send_main_menu(
+            chat_id,
+            f"✅ Підчерга {subqueue} обрана\n\n⚠️ Не зміг зараз отримати графік із сайту. Спробуй ще раз через хвилину."
         )
 
-    await cb.message.answer(text)
+
+@dp.callback_query(F.data.startswith("main:"))
+async def main_buttons(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    register_user(chat_id)
+    action = cb.data.split(":", 1)[1]
+    await cb.answer()
+
+    if action == "status":
+        await send_main_menu(chat_id, build_status_text(chat_id))
+
+    elif action == "notice":
+        cur = USER_NOTICE.get(chat_id, DEFAULT_NOTICE_MINUTES)
+        await cb.message.answer(
+            f"Оберіть за скільки хвилин попереджати.\nПоточне: {cur} хв",
+            reply_markup=keyboard_notice(cur)
+        )
+
+    elif action == "change":
+        await cb.message.answer("Ок, обери нову підчергу 👇", reply_markup=keyboard_choose_subqueue())
+
+    elif action == "stop":
+        USER_SUBQUEUE.pop(chat_id, None)
+        USER_LAST_HASH.pop(chat_id, None)
+        USER_LAST_SCHEDULE.pop(chat_id, None)
+        USER_LAST_UPDATE_MARKER.pop(chat_id, None)
+        USER_NOTIFIED_KEYS.pop(chat_id, None)
+        save_state()
+        await cb.message.answer("
+
+Сповіщення вимкнув ✅\nЩоб знову увімкнути — натисни /start")
+
+    elif action == "back":
+        # просто показуємо статус як "домашній" екран
+        await send_main_menu(chat_id, build_status_text(chat_id))
 
 
 @dp.callback_query(F.data.startswith("notice:"))
@@ -727,7 +722,7 @@ async def choose_notice(cb: CallbackQuery):
     save_state()
 
     await cb.answer("Збережено ✅")
-    await cb.message.answer(f"✅ Ок. Попереджатиму за {val} хв до події.")
+    await send_main_menu(chat_id, f"✅ Ок. Попереджатиму за {val} хв до події.")
 
 
 # =========================
@@ -778,8 +773,11 @@ async def admin_force(message: Message):
         return
 
     await message.answer("⏳ Ок, перевіряю сайт зараз...")
-    await process_site_once(send_updates=True)
-    await message.answer("✅ Готово.")
+    try:
+        await process_site_once(send_updates=True)
+        await message.answer("✅ Готово.")
+    except Exception as e:
+        await message.answer(f"⚠️ Помилка: {e}")
 
 
 @dp.message(F.text == "/time")
