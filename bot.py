@@ -694,9 +694,10 @@ async def main_buttons(cb: CallbackQuery):
         USER_LAST_UPDATE_MARKER.pop(chat_id, None)
         USER_NOTIFIED_KEYS.pop(chat_id, None)
         save_state()
-        await cb.message.answer("
-
-Сповіщення вимкнув ✅\nЩоб знову увімкнути — натисни /start")
+      await cb.message.answer(
+    "Сповіщення вимкнув ✅\n"
+    "Щоб знову увімкнути — натисни /start"
+)
 
     elif action == "back":
         # просто показуємо статус як "домашній" екран
@@ -808,3 +809,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
