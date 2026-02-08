@@ -729,7 +729,7 @@ async def choose_subqueue(cb: CallbackQuery):
             f"✅ Підчерга {subqueue} обрана\n"
             f"⏱ Попередження: за {notice} хв\n\n"
             f"{format_schedule_all_days(subqueue, schedule_by_day, update_marker)}\n\n"
-            f"Керування: /status /next /schedule /notice /change /stop"
+            
         )
     except Exception as e:
         print(f"[CHOOSE] failed: {e}")
@@ -822,3 +822,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
