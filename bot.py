@@ -687,17 +687,19 @@ async def main_buttons(cb: CallbackQuery):
     elif action == "change":
         await cb.message.answer("Ок, обери нову підчергу 👇", reply_markup=keyboard_choose_subqueue())
 
-    elif action == "stop":
-        USER_SUBQUEUE.pop(chat_id, None)
-        USER_LAST_HASH.pop(chat_id, None)
-        USER_LAST_SCHEDULE.pop(chat_id, None)
-        USER_LAST_UPDATE_MARKER.pop(chat_id, None)
-        USER_NOTIFIED_KEYS.pop(chat_id, None)
-        save_state()
-      await cb.message.answer(
-    "Сповіщення вимкнув ✅\n"
-    "Щоб знову увімкнути — натисни /start"
-)
+elif action == "stop":
+    USER_SUBQUEUE.pop(chat_id, None)
+    USER_LAST_HASH.pop(chat_id, None)
+    USER_LAST_SCHEDULE.pop(chat_id, None)
+    USER_LAST_UPDATE_MARKER.pop(chat_id, None)
+    USER_NOTIFIED_KEYS.pop(chat_id, None)
+    save_state()
+
+    await cb.message.answer(
+        "Сповіщення вимкнуто ✅\n"
+        "Щоб знову увімкнути — натисни /start"
+    )
+
 
     elif action == "back":
         # просто показуємо статус як "домашній" екран
@@ -809,4 +811,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
