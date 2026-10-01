@@ -393,7 +393,7 @@ def schedule_changed(old,new):
         if day not in old["days"] or set(map(tuple,values))!=set(map(tuple,old["days"][day])):
             return True
     return False
-def render_chart(p,payload,fetched,offset=0):
+def render_chart(p,payload,fetched,offset=0,marker=""):
     day = (local_time()+timedelta(days=offset)).strftime("%d.%m.%Y")
     font = lambda n: ImageFont.truetype(str(Path(__file__).with_name("DejaVuSans.ttf")),n)
     image = Image.new("RGB",(1200,690),"#111827")
@@ -418,7 +418,7 @@ def render_chart(p,payload,fetched,offset=0):
     draw.rectangle((390,491,410,511),fill="#ef4444")
     draw.text((421,486),"Відключення",font=font(19),fill="#e2e8f0")
     if not known: draw.text((60,535),"Графік поки недоступний" if not fetched or now_ts()-fetched>STALE_SECONDS else "Графік поки очікується",font=font(20),fill="#cbd5e1")
-    draw.text((60,582),source_update() or "Джерело: Рівнеобленерго",font=font(19),fill="#94a3b8")
+    draw.text((60,582),marker or "Джерело: Рівнеобленерго",font=font(19),fill="#94a3b8")
     draw.text((60,625),"Фактичне електропостачання може відрізнятися від графіка.",font=font(18),fill="#94a3b8")
     output=io.BytesIO()
     image.save(output,"PNG")
@@ -462,7 +462,7 @@ async def site_loop():
             await refresh_site()
         except asyncio.CancelledError: raise
         except Exception as exc:
-            log.warning("Site refresh failed: %s", type(exc).__name__)
+            log.warning("Site refresh failed: %s: %s", type(exc).__name__, str(exc))
             failures=int(db.get_meta("site_failures","0"))+1
             db.set_meta("site_failures",failures)
             db.set_meta("site_error",type(exc).__name__)
@@ -694,10 +694,11 @@ async def send_chart(cid,offset):
     p=db.place(cid)
     if not p: return await show_places(cid)
     payload,fetched=db.schedule(p["sq"])
+    marker=source_update()
     try:
-        png=await asyncio.to_thread(render_chart,p,payload,fetched,offset)
+        png=await asyncio.to_thread(render_chart,p,payload,fetched,offset,marker)
         await api_call("send_photo",cid,photo=BufferedInputFile(png,filename=f"schedule-{p['sq']}.png"),
-          caption=f"🏠 {p['name']} · {p['sq']}"+("\n"+source_update() if source_update() else ""),
+          caption=f"🏠 {p['name']} · {p['sq']}"+("\n"+marker if marker else ""),
           reply_markup=buttons([[("← До графіка",f"graph:{offset}")]]))
     except TelegramForbiddenError: db.run("UPDATE users SET blocked=1 WHERE chat_id=?",(cid,))
     except (OSError,TelegramRetryAfter,TelegramNetworkError,TelegramServerError,TelegramBadRequest):
@@ -994,7 +995,8 @@ async def callbacks(cb: CallbackQuery):
 
 @dp.errors()
 async def handler_error(event):
-    log.error("Handler failed: %s",type(event.exception).__name__)
+    log.error("Handler failed: %s",type(event.exception).__name__,
+              exc_info=(type(event.exception),event.exception,event.exception.__traceback__))
     if ADMIN_ID and db:
         db.enqueue(ADMIN_ID,"⚠️ Виникла помилка обробки дії. Перевірте Logs у Render.",
           kind="admin",dedupe=f"handler-error:{now_ts()//3600}")
