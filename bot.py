@@ -75,6 +75,8 @@ class Store:
         """)
         try:
             self.migrate(legacy)
+            # Public Telegram names are not needed for notifications.
+            self.run("UPDATE users SET name='' WHERE name<>''")
         except Exception:
             self.conn.close()
             raise
@@ -113,7 +115,7 @@ class Store:
             self.conn.execute("INSERT INTO meta VALUES('legacy_imported_at',?)", (str(now_ts()),))
         log.info("Imported %s legacy users", len(data["users"]))
     def user(self, cid, name=""):
-        self.run("INSERT INTO users(chat_id,created,name) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET blocked=0,name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE users.name END", (cid, now_ts(), name[:100]))
+        self.run("INSERT INTO users(chat_id,created) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET blocked=0,name=''", (cid, now_ts()))
         return self.one("SELECT * FROM users WHERE chat_id=?", (cid,))
     def places(self, cid): return self.all("SELECT * FROM places WHERE chat_id=? ORDER BY id", (cid,))
     def place(self, cid, pid=None):
@@ -700,10 +702,12 @@ async def show_about(cid):
         rows.append([InlineKeyboardButton(text="💛 Підтримати ініціативу",url=DONATION_URL)])
     rows.extend([[InlineKeyboardButton(text="✍️ Написати відгук",callback_data="feedback")],
                  [InlineKeyboardButton(text="⬅️ Головне меню",callback_data="home")]])
-    await say(cid,f"💡 {BOT_NAME}\n\n{ABOUT}\n\nСоціальна ініціатива. Підтримка добровільна.\n"
-      "Графіки беремо з сайту Рівнеобленерго. Це планові дані, а не вимірювання електропостачання.\n"
-      "Зберігаємо Telegram ID, назви ваших адрес, підчерги та налаштування. Повідомлення «світло є / немає» показуємо лише у зведенні без імен.\n"
-      "Команда /delete_me видаляє ваші дані з робочої бази. Резервні копії зберігаються до 14 днів.",InlineKeyboardMarkup(inline_keyboard=rows))
+    await say(cid,f"💡 {BOT_NAME}\n\n{ABOUT}\n\n"
+      "🏠 Точну адресу та номер телефону вводити не потрібно — достатньо обрати підчергу. «Дім» чи «Робота» — лише зручні підписи, які ви придумуєте самі.\n\n"
+      "🔔 Бот запам’ятовує підчерги, підписи й налаштування сповіщень. Telegram ID — службовий номер, за яким бот надсилає вам повідомлення. Це не номер телефону й не доступ до вашого акаунта чи приватного листування.\n\n"
+      "💡 Повідомлення «світло є / немає» показуємо у зведенні без імен. Графіки беремо з сайту Рівнеобленерго; фактичне світло може відрізнятися від графіка.\n\n"
+      "💛 Соціальна ініціатива. Підтримка добровільна.\n\n"
+      "Прибрати збережені налаштування та інші ваші дані з робочої бази можна командою /delete_me. Резервні копії оновлюються; старі зберігаються до 14 днів.",InlineKeyboardMarkup(inline_keyboard=rows))
 
 async def send_chart(cid,offset):
     p=db.place(cid)
