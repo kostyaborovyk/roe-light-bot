@@ -70,6 +70,7 @@ class Store:
           created INTEGER NOT NULL,PRIMARY KEY(chat_id,sq));
         CREATE TABLE IF NOT EXISTS sessions(chat_id INTEGER PRIMARY KEY,kind TEXT NOT NULL,payload TEXT NOT NULL,expires INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS drafts(token TEXT PRIMARY KEY,chat_id INTEGER NOT NULL,target TEXT NOT NULL,text TEXT NOT NULL,expires INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS ui_cards(chat_id INTEGER PRIMARY KEY,message_id INTEGER,revision TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS feedback(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL,text TEXT NOT NULL,created INTEGER NOT NULL);
         """)
         try:
@@ -230,35 +231,21 @@ def next_event(payload, now):
 def duration_text(seconds):
     mins = max(0, int(seconds//60))
     return f"{mins//60} год {mins%60} хв" if mins >= 60 else f"{mins} хв"
-def schedule_diff(old, new, today):
-    lines = []
-    for day in sorted(set(old["days"]) | set(new["days"]), key=lambda d: datetime.strptime(d, "%d.%m.%Y")):
-        if datetime.strptime(day, "%d.%m.%Y").date() < today or day not in new["days"]: continue
-        before, after = set(map(tuple, old["days"].get(day, []))), set(map(tuple, new["days"][day]))
-        if before == after and day in old["days"]: continue
-        removed, added = sorted(before-after), sorted(after-before)
-        lines.append(f"📅 {day}")
-        if day not in old["days"]:
-            lines.append("Новий графік: " + (", ".join(f"{a}–{b}" for a,b in sorted(after)) or "відключень не заплановано"))
-        elif len(removed) == len(added) == 1:
-            lines.append(f"Змінено: {removed[0][0]}–{removed[0][1]} → {added[0][0]}–{added[0][1]}")
-        else:
-            lines.extend(f"➖ Прибрали: {a}–{b}" for a,b in removed)
-            lines.extend(f"➕ Додали: {a}–{b}" for a,b in added)
-    return "\n".join(lines)[:3000]
 
 db = None
 bot = None
 dp = Dispatcher()
 fetch_lock, delivery_lock = asyncio.Lock(), asyncio.Lock()
 last_delivery, chat_delivery = 0.0, {}
+ui_locks = {}
 def buttons(rows):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=c) for t,c in row] for row in rows])
-def main_keyboard():
-    return buttons([[("🏠 Поточний стан","home")], [("📅 Сьогодні","day:0"),("📅 Завтра","day:1")],
-      [("🖼 Графік-картинка","image:0"),("📍 Мої адреси","places")],
-      [("🔔 Налаштування","settings"),("💡 Світло є / немає","reports")],
-      [("ℹ️ Про бота","about"),("✍️ Відгук","feedback")]])
+def main_keyboard(cid=None):
+    rows=[[("📅 Графік","graph")],[("💡 Повідомити про світло","reports")],[("⚙️ Налаштування","settings")]]
+    if cid is not None and len(db.places(cid))>1:
+        p=db.place(cid)
+        rows.insert(0,[(f"🏠 {p['name'][:30]} ▾","switchplace")])
+    return buttons(rows)
 async def api_call(method, cid, **kwargs):
     global last_delivery
     async with delivery_lock:
@@ -270,60 +257,142 @@ async def api_call(method, cid, **kwargs):
             chat_delivery[cid] = last_delivery
             if len(chat_delivery)>10000:
                 for old in [k for k,v in chat_delivery.items() if v<last_delivery-60]: chat_delivery.pop(old,None)
-async def say(cid, text, markup=None):
-    try: return await api_call("send_message", cid, text=text[:4000], reply_markup=markup)
-    except TelegramForbiddenError: db.run("UPDATE users SET blocked=1 WHERE chat_id=?", (cid,))
-    except TelegramRetryAfter as exc:
-        db.set_meta("telegram_pause",now_ts()+int(exc.retry_after)+1)
-        db.enqueue(cid,text[:4000],markup=markup)
-    except (TelegramNetworkError, TelegramServerError): db.enqueue(cid, text[:4000], markup=markup)
-    except TelegramBadRequest: log.warning("Invalid reply for chat=%s", cid)
+async def deliver_ui(cid,text,markup,revision):
+    card=db.one("SELECT * FROM ui_cards WHERE chat_id=?",(cid,))
+    if not card or card["revision"]!=revision:
+        return None
+    if card["message_id"]:
+        try:
+            return await api_call("edit_message_text",cid,message_id=card["message_id"],text=text,reply_markup=markup)
+        except TelegramBadRequest as exc:
+            message=str(exc).lower()
+            if "message is not modified" in message:
+                return None
+            if not any(x in message for x in ("message to edit not found","message can't be edited","message can not be edited","there is no text")):
+                raise
+    result=await api_call("send_message",cid,text=text,reply_markup=markup)
+    message_id=getattr(result,"message_id",None)
+    if isinstance(message_id,int):
+        db.run("UPDATE ui_cards SET message_id=? WHERE chat_id=? AND revision=?",(message_id,cid,revision))
+    return result
+
+async def say(cid,text,markup=None):
+    text=text[:4000]
+    async with ui_locks.setdefault(cid,asyncio.Lock()):
+        revision=secrets.token_hex(8)
+        db.run("INSERT INTO ui_cards(chat_id,revision) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET revision=excluded.revision",(cid,revision))
+        try:
+            return await deliver_ui(cid,text,markup,revision)
+        except TelegramForbiddenError:
+            db.run("UPDATE users SET blocked=1 WHERE chat_id=?",(cid,))
+        except (TelegramRetryAfter,TelegramNetworkError,TelegramServerError) as exc:
+            if isinstance(exc,TelegramRetryAfter):
+                db.set_meta("telegram_pause",now_ts()+int(exc.retry_after)+1)
+            dedupe=f"ui:{cid}:{revision}"
+            db.enqueue(cid,text,kind="ui",dedupe=dedupe,markup=markup)
+            row=db.one("SELECT payload FROM outbox WHERE dedupe=?",(dedupe,))
+            payload=json.loads(row["payload"])
+            payload["revision"]=revision
+            db.run("UPDATE outbox SET payload=? WHERE dedupe=?",(jdump(payload),dedupe))
+        except TelegramBadRequest:
+            log.warning("Invalid reply for chat=%s",cid)
     return None
 def report_summary(sq):
     rows = db.all("SELECT is_on,created FROM reports WHERE sq=? AND created>?", (sq,now_ts()-REPORT_TTL))
-    if not rows: return "👥 Свіжих повідомлень користувачів поки немає."
+    if not rows: return ""
     on = sum(r["is_on"] for r in rows)
     return (f"👥 За останні 10 хв: світло є — {on}, немає — {len(rows)-on}.\n"
       f"Останнє повідомлення: {stamp(max(r['created'] for r in rows))}.\n"
       "Це відгуки з різних місць підчерги, а не перевірка вашого будинку.")
+def source_update(marker=None):
+    marker=marker if marker is not None else db.get_meta("marker","")
+    return marker.strip() if marker else ""
+
+def event_label(event,now=None):
+    now=now or local_time()
+    if event.date()==now.date(): return f"о {event:%H:%M}"
+    if event.date()==(now+timedelta(days=1)).date(): return f"завтра о {event:%H:%M}"
+    return f"{event:%d.%m} о {event:%H:%M}"
+
 def status_text(cid):
-    p = db.place(cid)
-    if not p: return "👋 Додайте першу адресу: натисніть «Мої адреси». Потрібні лише назва та підчерга."
-    payload,fetched = db.schedule(p["sq"])
-    now = local_time()
-    lines = [f"📍 {p['name']} · підчерга {p['sq']}"]
-    if now.strftime("%d.%m.%Y") not in payload["days"]: lines.append("⚪ Графік на сьогодні очікується або ще не отриманий.")
+    p=db.place(cid)
+    if not p:
+        return "👋 Додайте адресу в «Налаштування → Мої адреси». Потрібні лише назва та підчерга."
+    payload,fetched=db.schedule(p["sq"])
+    now=local_time()
+    day=now.strftime("%d.%m.%Y")
+    lines=[f"🏠 {p['name']} · {p['sq']}"]
+    if not fetched or now_ts()-fetched>STALE_SECONDS:
+        lines.append("⚪ Графік поки недоступний")
+    elif day not in payload["days"]:
+        lines.append("⚪ Графік поки очікується")
     else:
-        off = any(a<=now<b for a,b in intervals_for(payload))
+        off=any(a<=now<b for a,b in intervals_for(payload))
         lines.append("🔴 За графіком зараз відключення" if off else "🟢 За графіком зараз має бути світло")
-        event,kind = next_event(payload,now)
+        event,kind=next_event(payload,now)
         if event:
-            label = "Відновлення" if kind=="on" else "Відключення"
-            lines.append(f"⏰ {label}: {event.strftime('%d.%m о %H:%M')} — через {duration_text((event-now).total_seconds())}")
-            if kind=="off":
-                end = next(b for a,b in intervals_for(payload) if a==event)
-                lines.append(f"⏳ Запланована тривалість: {duration_text((end-event).total_seconds())}")
-        else: lines.append("Наступних подій у доступному графіку немає.")
-    lines.append(f"🔄 Успішна перевірка сайту: {stamp(fetched)}")
-    if not fetched or now_ts()-fetched>STALE_SECONDS: lines.append("⚠️ Дані застарілі або недоступні. Стан може бути неточним.")
-    if not db.one("SELECT subscribed FROM users WHERE chat_id=?",(cid,))["subscribed"] or not p["enabled"]: lines.append("🔕 Сповіщення вимкнені.")
-    return "\n".join(lines+["",report_summary(p["sq"])])
-def day_text(p, offset=0):
-    day = (local_time()+timedelta(days=offset)).strftime("%d.%m.%Y")
-    payload,fetched = db.schedule(p["sq"])
-    lines = [f"📍 {p['name']} · {p['sq']}",f"📅 {day}"]
-    if day not in payload["days"]: lines.append("⚪ Графік очікується або поки недоступний.")
-    else:
-        values = payload["days"][day]
-        lines.extend(f"🔴 {a}–{b}" for a,b in values)
-        if not values: lines.append("🟢 Відключень за графіком не заплановано.")
-        start,finish = clock_dt(day,"00:00"),clock_dt(day,"24:00")
-        total = sum(max(0,(min(b,finish)-max(a,start)).total_seconds()) for a,b in intervals_for(payload))
-        lines.append(f"Сумарно за графіком: {duration_text(total)} без світла.")
-    lines.append(f"\nПеревірено: {stamp(fetched)}")
-    if not fetched or now_ts()-fetched>STALE_SECONDS: lines.append("⚠️ Дані застарілі або недоступні.")
-    lines.append("Аварійні відключення та фактичний стан можуть відрізнятися.")
+            remaining=duration_text(event.timestamp()-now.timestamp())
+            if kind=="on":
+                lines.append(f"🟢 Очікуване відновлення {event_label(event,now)} — через {remaining}")
+            else:
+                end=next(b for a,b in intervals_for(payload) if a==event)
+                lines.append(f"🔴 Наступне відключення {event_label(event,now)} — через {remaining}")
+                lines.append(f"⏳ До {end:%H:%M}, тривалість {duration_text(end.timestamp()-event.timestamp())}")
+        else:
+            lines.append("Наступних відключень у доступному графіку немає")
+    marker=source_update()
+    if marker: lines.extend(["",marker])
+    user=db.one("SELECT subscribed FROM users WHERE chat_id=?",(cid,))
+    if not user["subscribed"] or not p["enabled"]:
+        lines.append("🔕 Сповіщення вимкнені")
     return "\n".join(lines)
+def graph_keyboard(offset=0):
+    return buttons([[("✓ Сьогодні" if offset==0 else "Сьогодні","day:0"),("✓ Завтра" if offset==1 else "Завтра","day:1")],
+                    [("🖼 Графік-картинка",f"image:{offset}")],[("← Назад","home")]])
+
+def day_lines(payload,day):
+    title="сьогодні" if day==local_time().strftime("%d.%m.%Y") else "завтра" if day==(local_time()+timedelta(days=1)).strftime("%d.%m.%Y") else ""
+    lines=[f"📅 {day}"+(f" · {title}" if title else "")]
+    if day not in payload["days"]:
+        return lines+["⚪ Графік поки очікується"]
+    values=payload["days"][day]
+    lines.extend(f"🔴 {a}–{b}" for a,b in values)
+    if not values: lines.append("🟢 Відключень за графіком не заплановано")
+    start,finish=clock_dt(day,"00:00"),clock_dt(day,"24:00")
+    total=sum(max(0,min(b,finish).timestamp()-max(a,start).timestamp()) for a,b in intervals_for(payload))
+    lines.append(f"Загалом за графіком: {duration_text(total)} без світла")
+    return lines
+
+def day_text(p,offset=0):
+    day=(local_time()+timedelta(days=offset)).strftime("%d.%m.%Y")
+    payload,fetched=db.schedule(p["sq"])
+    lines=[f"🏠 {p['name']} · {p['sq']}",""]
+    if not fetched or now_ts()-fetched>STALE_SECONDS:
+        lines.append("⚪ Графік поки недоступний")
+    else:
+        lines.extend(day_lines(payload,day))
+    marker=source_update()
+    if marker: lines.extend(["",marker])
+    return "\n".join(lines)
+
+def full_graph(p,payload,marker):
+    today=local_time().date()
+    days=sorted((d for d in set(payload["days"])|set(payload["pending"]) if datetime.strptime(d,"%d.%m.%Y").date()>=today),
+                key=lambda d:datetime.strptime(d,"%d.%m.%Y"))
+    lines=[f"🔄 Оновився графік · {p['name']} · {p['sq']}"]
+    for day in days:
+        lines.extend([""]+day_lines(payload,day))
+    if marker: lines.extend(["",source_update(marker)])
+    return "\n".join(lines)[:3900]
+
+def schedule_changed(old,new):
+    today=local_time().date()
+    # A site outage or a waiting cell is not an explicit cancellation.
+    for day,values in new["days"].items():
+        if datetime.strptime(day,"%d.%m.%Y").date()<today: continue
+        if day not in old["days"] or set(map(tuple,values))!=set(map(tuple,old["days"][day])):
+            return True
+    return False
 def render_chart(p,payload,fetched,offset=0):
     day = (local_time()+timedelta(days=offset)).strftime("%d.%m.%Y")
     font = lambda n: ImageFont.truetype(str(Path(__file__).with_name("DejaVuSans.ttf")),n)
@@ -332,7 +401,7 @@ def render_chart(p,payload,fetched,offset=0):
     draw.text((60,40),BOT_NAME[:40],font=font(34),fill="#f8fafc")
     draw.text((60,99),f"{p['name'][:32]}  /  підчерга {p['sq']}",font=font(26),fill="#cbd5e1")
     draw.text((60,145),f"Графік на {day}",font=font(24),fill="#94a3b8")
-    known,start = day in payload["days"],clock_dt(day,"00:00")
+    known,start = day in payload["days"] and bool(fetched) and now_ts()-fetched<=STALE_SECONDS,clock_dt(day,"00:00")
     for row in range(2):
         y=235+row*130
         for cell in range(12):
@@ -348,9 +417,8 @@ def render_chart(p,payload,fetched,offset=0):
     draw.text((91,486),"Світло за графіком",font=font(19),fill="#e2e8f0")
     draw.rectangle((390,491,410,511),fill="#ef4444")
     draw.text((421,486),"Відключення",font=font(19),fill="#e2e8f0")
-    if not known: draw.text((60,535),"Графік очікується — сірі блоки означають невідомий стан",font=font(20),fill="#fbbf24")
-    elif now_ts()-fetched>STALE_SECONDS: draw.text((60,535),"Увага: дані застарілі",font=font(20),fill="#fbbf24")
-    draw.text((60,582),f"Перевірено: {stamp(fetched)} · джерело: Рівнеобленерго",font=font(19),fill="#94a3b8")
+    if not known: draw.text((60,535),"Графік поки недоступний" if not fetched or now_ts()-fetched>STALE_SECONDS else "Графік поки очікується",font=font(20),fill="#cbd5e1")
+    draw.text((60,582),source_update() or "Джерело: Рівнеобленерго",font=font(19),fill="#94a3b8")
     draw.text((60,625),"Фактичне електропостачання може відрізнятися від графіка.",font=font(18),fill="#94a3b8")
     output=io.BytesIO()
     image.save(output,"PNG")
@@ -374,12 +442,12 @@ async def refresh_site():
         with db.conn:
             for sq, payload in schedules.items():
                 old, previous = db.schedule(sq)
-                diff = schedule_diff(old, payload, local_time().date()) if previous else ""
+                changed = bool(previous and schedule_changed(old,payload))
                 db.conn.execute("INSERT INTO schedules VALUES(?,?,?) ON CONFLICT(sq) DO UPDATE SET payload=excluded.payload,fetched=excluded.fetched", (sq,jdump(payload),fetched))
-                if diff:
+                if changed:
                     for p in db.all("SELECT p.* FROM places p JOIN users u ON u.chat_id=p.chat_id WHERE p.sq=? AND p.enabled=1 AND p.updates=1 AND u.subscribed=1 AND u.blocked=0",(sq,)):
-                        db.enqueue(p["chat_id"],f"🔄 Змінився графік\n📍 {p['name']} · {sq}\n\n{diff}\n\nПеревірено: {stamp(fetched)}",
-                          kind="update",dedupe=f"change:{p['id']}:{fetched}",pid=p["id"],expires=fetched+3600,markup=main_keyboard())
+                        db.enqueue(p["chat_id"],full_graph(p,payload,marker),
+                          kind="update",dedupe=f"change:{p['id']}:{fetched}",pid=p["id"],expires=fetched+3600,markup=buttons([[("📅 Відкрити графік",f"open:{p['id']}")]]))
             db.conn.execute("INSERT INTO meta VALUES('last_good',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(fetched),))
             db.conn.execute("INSERT INTO meta VALUES('marker',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(marker,))
             db.conn.execute("INSERT INTO meta VALUES('site_failures','0') ON CONFLICT(key) DO UPDATE SET value='0'")
@@ -404,6 +472,19 @@ async def site_loop():
                     db.enqueue(ADMIN_ID,f"⚠️ Не вдалося отримати графік {failures} рази поспіль.\nОстання успішна перевірка: {stamp(int(db.get_meta('last_good','0')))}.\nБот показує збережені дані з позначкою часу.",kind="admin")
         await asyncio.sleep(CHECK_SECONDS)
 
+
+def reminder_text(p,event_ts,kind,ts=None):
+    ts=now_ts() if ts is None else ts
+    event=local_time(event_ts)
+    remaining=duration_text(event_ts-ts)
+    if kind=="on":
+        return f"🟢 За {remaining} очікується відновлення\n🏠 {p['name']} · {p['sq']}\n{event_label(event)}, за графіком."
+    payload,_=db.schedule(p["sq"])
+    end=next((b for a,b in intervals_for(payload) if int(a.timestamp())==event_ts),None)
+    interval=f"{event:%H:%M}–{end:%H:%M} · {duration_text(end.timestamp()-event_ts)}" if end else f"{event:%H:%M}"
+    date=f"{event:%d.%m} · " if event.date()!=local_time(ts).date() else ""
+    return f"🔴 За {remaining} — можливе відключення\n🏠 {p['name']} · {p['sq']}\n{date}{interval}\nЗа графіком Рівнеобленерго."
+
 def queue_reminders(ts=None):
     ts=now_ts() if ts is None else ts
     now=local_time(ts)
@@ -419,10 +500,7 @@ def queue_reminders(ts=None):
                     # Catch up short restarts, but never send a reminder after its event.
                     grace=min(notice*60,600)
                     if not notify<=ts<event_ts or ts-notify>grace: continue
-                    remaining=duration_text(event_ts-ts)
-                    text=(f"{'🔴' if kind=='off' else '🟢'} {'Можливе відключення' if kind=='off' else 'Очікується відновлення'} світла\n"
-                      f"📍 {p['name']} · {p['sq']}\n⏰ {event.strftime('%d.%m о %H:%M')} — залишилося {remaining}.\n"
-                      "За графіком Рівнеобленерго; фактичний час може відрізнятися.")
+                    text=reminder_text(p,event_ts,kind,ts)
                     db.enqueue(p["chat_id"],text,kind=f"reminder_{kind}",pid=p["id"],event=event_ts,notice=notice,
                       expires=event_ts,dedupe=f"reminder:{p['id']}:{kind}:{event_ts}:{notice}")
 
@@ -436,6 +514,10 @@ async def reminder_loop():
 def eligible(row):
     user=db.one("SELECT * FROM users WHERE chat_id=?",(row["chat_id"],))
     if user and user["blocked"]: return False
+    if row["kind"]=="ui":
+        payload=json.loads(row["payload"])
+        card=db.one("SELECT revision FROM ui_cards WHERE chat_id=?",(row["chat_id"],))
+        return bool(card and card["revision"]==payload.get("revision"))
     if row["kind"]=="broadcast":
         return bool(user and user["subscribed"])
     if not row["place_id"]: return True
@@ -465,7 +547,15 @@ async def deliver_once():
     payload=json.loads(row["payload"])
     markup=InlineKeyboardMarkup.model_validate(payload["markup"]) if payload.get("markup") else None
     try:
-        await api_call("send_message",row["chat_id"],text=payload["text"],reply_markup=markup)
+        if row["kind"]=="ui":
+            async with ui_locks.setdefault(row["chat_id"],asyncio.Lock()):
+                await deliver_ui(row["chat_id"],payload["text"],markup,payload["revision"])
+        else:
+            text=payload["text"]
+            if row["kind"].startswith("reminder_"):
+                place=db.place(row["chat_id"],row["place_id"])
+                text=reminder_text(place,row["event_ts"],row["kind"].split("_",1)[1])
+            await api_call("send_message",row["chat_id"],text=text,reply_markup=markup)
     except TelegramForbiddenError:
         with db.conn:
             db.conn.execute("UPDATE users SET blocked=1 WHERE chat_id=?",(row["chat_id"],))
@@ -526,16 +616,27 @@ async def maintenance_loop():
 def settings_keyboard(p):
     notices=set(json.loads(p["notices"]))
     rows=[[(f"{'✅ ' if v in notices else ''}{v} хв",f"notice2:{p['id']}:{v}") for v in NOTICES]]
-    for field,label in (("updates","Зміни графіка"),("off_alert","Відключення"),("on_alert","Відновлення"),("enabled","Сповіщення адреси")):
+    for field,label in (("updates","Оновлення графіка"),("off_alert","Попередження про відключення"),("on_alert","Попередження про відновлення"),("enabled","Сповіщення адреси")):
         rows.append([(f"{'✅' if p[field] else '🔕'} {label}",f"toggle:{p['id']}:{field}")])
     u=db.one("SELECT subscribed FROM users WHERE chat_id=?",(p["chat_id"],))
-    rows.extend([[(f"{'🔕 Вимкнути' if u['subscribed'] else '🔔 Увімкнути'} всі сповіщення","subscription")],[("⬅️ Головне меню","home")]])
+    rows.extend([[(f"{'🔕 Вимкнути' if u['subscribed'] else '🔔 Увімкнути'} всі сповіщення","subscription")],[("← Назад","settings")]])
     return buttons(rows)
 
+def settings_menu():
+    rows=[[("📍 Мої адреси","places")],[("🔔 Сповіщення","alerts")],[("ℹ️ Про бота","about")],[("✍️ Написати відгук","feedback")]]
+    if DONATION_URL.startswith(("https://","http://")):
+        markup=buttons(rows+[[("← Назад","home")]])
+        markup.inline_keyboard.insert(-1,[InlineKeyboardButton(text="💛 Підтримати ініціативу",url=DONATION_URL)])
+        return markup
+    return buttons(rows+[[("← Назад","home")]])
+
 async def show_settings(cid):
+    await say(cid,"⚙️ Налаштування",settings_menu())
+
+async def show_alerts(cid):
     p=db.place(cid)
     if not p: return await show_places(cid)
-    await say(cid,f"🔔 {p['name']} · {p['sq']}\nМожна вибрати кілька попереджень: 5, 10, 30 хв. Позначка ✅ означає, що опція ввімкнена.",settings_keyboard(p))
+    await say(cid,f"🔔 {p['name']} · {p['sq']}\nПопереджати за:\nМожна вибрати кілька часів.",settings_keyboard(p))
 
 async def show_places(cid):
     places=db.places(cid)
@@ -545,8 +646,8 @@ async def show_places(cid):
     if selected:
         rows.extend([[("✏️ Назва",f"rename:{selected['id']}"),("🔁 Підчерга",f"change:{selected['id']}")],
                      [("🗑 Видалити адресу",f"removeask:{selected['id']}")]])
-    rows.append([("⬅️ Головне меню","home")])
-    await say(cid,f"📍 Мої адреси ({len(places)}/{MAX_PLACES})\nВибрана адреса використовується для перегляду. Сповіщення працюють для всіх увімкнених адрес.",buttons(rows))
+    rows.append([("← Назад","settings")])
+    await say(cid,f"📍 Мої адреси · {len(places)}/{MAX_PLACES}",buttons(rows))
 
 def queue_keyboard(prefix):
     rows=[[(sq,f"{prefix}:{sq}") for sq in SUBQUEUES[i:i+2]] for i in range(0,12,2)]
@@ -572,7 +673,7 @@ def stats_text():
 def health_text():
     pending=db.one("SELECT COUNT(*) n FROM outbox WHERE status='pending'")["n"]
     failed=db.one("SELECT COUNT(*) n FROM outbox WHERE status='failed' AND created>?",(now_ts()-86400,))["n"]
-    return (f"🩺 Бот v2.0\nОстання перевірка: {stamp(int(db.get_meta('last_good','0')))}\n"
+    return (f"🩺 Бот v2.1\nОстання перевірка: {stamp(int(db.get_meta('last_good','0')))}\n"
       f"Послідовних помилок сайту: {db.get_meta('site_failures','0')}\n"
       f"Повідомлень у черзі: {pending}\nНевдалих доставок за добу: {failed}\n"
       f"Остання щоденна копія: {db.get_meta('last_backup','ще немає')}\n"
@@ -596,12 +697,12 @@ async def send_chart(cid,offset):
     try:
         png=await asyncio.to_thread(render_chart,p,payload,fetched,offset)
         await api_call("send_photo",cid,photo=BufferedInputFile(png,filename=f"schedule-{p['sq']}.png"),
-          caption=f"📍 {p['name']} · {p['sq']}\nГрафік Рівнеобленерго. Перевірено: {stamp(fetched)}",
-          reply_markup=buttons([[("🖼 Сьогодні","image:0"),("🖼 Завтра","image:1")],[("⬅️ Меню","home")]]))
+          caption=f"🏠 {p['name']} · {p['sq']}"+("\n"+source_update() if source_update() else ""),
+          reply_markup=buttons([[("← До графіка",f"graph:{offset}")]]))
     except TelegramForbiddenError: db.run("UPDATE users SET blocked=1 WHERE chat_id=?",(cid,))
     except (OSError,TelegramRetryAfter,TelegramNetworkError,TelegramServerError,TelegramBadRequest):
         log.warning("Chart unavailable")
-        await say(cid,"⚠️ Картинка зараз недоступна. Надсилаю текстовий графік.\n\n"+day_text(p,offset),main_keyboard())
+        await say(cid,"⚠️ Картинка зараз недоступна. Надсилаю текстовий графік.\n\n"+day_text(p,offset),main_keyboard(cid))
 
 
 def recipients(target):
@@ -665,28 +766,29 @@ async def messages(message: Message):
     command=text.split(maxsplit=1)[0].split("@",1)[0].lower() if text.startswith("/") else ""
     if command=="/cancel":
         db.clear_session(cid)
-        return await say(cid,"Дію скасовано.",main_keyboard())
+        return await say(cid,"Дію скасовано.",main_keyboard(cid))
     if command:
+        db.run("DELETE FROM ui_cards WHERE chat_id=?",(cid,))
         db.clear_session(cid)
         if command=="/start":
             db.run("UPDATE users SET subscribed=1 WHERE chat_id=?",(cid,))
             if not db.places(cid):
                 db.session(cid,"addqueue",{"name":"Дім"})
                 await say(cid,"👋 Оберіть підчергу для першої адреси «Дім». Пізніше можна перейменувати її та додати інші.",queue_keyboard("sqnew"))
-            else: await say(cid,status_text(cid),main_keyboard())
-        elif command in ("/status","/next","/menu"): await say(cid,status_text(cid),main_keyboard())
+            else: await say(cid,status_text(cid),main_keyboard(cid))
+        elif command in ("/status","/next","/menu"): await say(cid,status_text(cid),main_keyboard(cid))
         elif command=="/schedule":
             p=db.place(cid)
-            if p: await say(cid,day_text(p),buttons([[("📅 Завтра","day:1"),("🖼 Картинка","image:0")],[("⬅️ Меню","home")]]))
+            if p: await say(cid,day_text(p),graph_keyboard())
             else: await show_places(cid)
-        elif command=="/notice": await show_settings(cid)
+        elif command=="/notice": await show_alerts(cid)
         elif command=="/change":
             p=db.place(cid)
             if p: await say(cid,"Оберіть нову підчергу.",queue_keyboard(f"sqchange:{p['id']}"))
             else: await show_places(cid)
         elif command=="/stop":
             db.run("UPDATE users SET subscribed=0 WHERE chat_id=?",(cid,))
-            await say(cid,"🔕 Усі сповіщення вимкнено. Адреси збережено. Увімкнути знову можна через налаштування або /start.",main_keyboard())
+            await say(cid,"🔕 Усі сповіщення вимкнено. Адреси збережено. Увімкнути знову можна через налаштування або /start.",main_keyboard(cid))
         elif command=="/about": await show_about(cid)
         elif command=="/feedback":
             db.session(cid,"feedback")
@@ -705,10 +807,10 @@ async def messages(message: Message):
                 content=text.split(maxsplit=1)
                 if len(content)==2: await broadcast_preview(cid,"all",content[1])
                 else: await admin_action(cid,"broadcast")
-        else: await say(cid,"Оберіть дію в меню або використайте /start.",main_keyboard())
+        else: await say(cid,"Оберіть дію в меню або використайте /start.",main_keyboard(cid))
         return
     state=db.session(cid)
-    if not state: return await say(cid,"Оберіть дію в меню.",main_keyboard())
+    if not state: return await say(cid,"Оберіть дію в меню.",main_keyboard(cid))
     kind,data=state["kind"],state["payload"]
     if kind in ("addname","rename"):
         if not 1<=len(text)<=40: return await say(cid,"Назва має містити 1–40 символів. Наприклад: Дім, Батьки або Робота.")
@@ -727,7 +829,7 @@ async def messages(message: Message):
         r=db.run("INSERT INTO feedback(chat_id,text,created) VALUES(?,?,?)",(cid,text,now_ts()))
         db.clear_session(cid)
         if ADMIN_ID: db.enqueue(ADMIN_ID,f"✍️ Новий відгук #{r.lastrowid}\nВід: {cid}\n\n{text}",kind="admin")
-        await say(cid,"Дякую! Відгук збережено для автора бота.",main_keyboard())
+        await say(cid,"Дякую! Відгук збережено для автора бота.",main_keyboard(cid))
     elif kind=="broadcast":
         if cid==ADMIN_ID:
             await broadcast_preview(cid,data["target"],text)
@@ -745,12 +847,33 @@ async def callbacks(cb: CallbackQuery):
     data=cb.data or ""
     parts=data.split(":")
     action=parts[0]
+    if action in ("open","graph") or cb.message.photo:
+        # Opening a schedule from a notification never edits that notification.
+        if action=="open" or cb.message.photo:
+            db.run("DELETE FROM ui_cards WHERE chat_id=?",(cid,))
+    else:
+        revision=secrets.token_hex(8)
+        db.run("INSERT INTO ui_cards VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET message_id=excluded.message_id,revision=excluded.revision",(cid,cb.message.message_id,revision))
+    if action=="open" and len(parts)==2 and parts[1].isdigit():
+        p=db.place(cid,int(parts[1]))
+        if not p: return await say(cid,"Ця адреса вже недоступна.",main_keyboard(cid))
+        db.run("UPDATE users SET selected=? WHERE chat_id=?",(p["id"],cid))
+        return await say(cid,day_text(p),graph_keyboard())
+    if action=="graph":
+        offset=int(parts[1]) if len(parts)==2 and parts[1] in ("0","1") else 0
+        p=db.place(cid)
+        if not p: return await show_places(cid)
+        return await say(cid,day_text(p,offset),graph_keyboard(offset))
+    if data=="switchplace":
+        rows=[[(f"{p['name']} · {p['sq']}",f"select:{p['id']}")] for p in db.places(cid)]
+        return await say(cid,"🏠 Оберіть адресу",buttons(rows+[[("← Назад","home")]]))
+    if data=="alerts": return await show_alerts(cid)
     if data=="home":
         db.clear_session(cid)
-        return await say(cid,status_text(cid),main_keyboard())
+        return await say(cid,status_text(cid),main_keyboard(cid))
     if data=="cancel":
         db.clear_session(cid)
-        return await say(cid,"Дію скасовано.",main_keyboard())
+        return await say(cid,"Дію скасовано.",main_keyboard(cid))
     if data=="places": return await show_places(cid)
     if data=="settings": return await show_settings(cid)
     if data=="about": return await show_about(cid)
@@ -759,9 +882,9 @@ async def callbacks(cb: CallbackQuery):
         return await say(cid,"Напишіть відгук одним текстовим повідомленням (до 2000 символів). Скасувати: /cancel.")
     if data=="subscription":
         db.run("UPDATE users SET subscribed=1-subscribed WHERE chat_id=?",(cid,))
-        return await show_settings(cid)
+        return await show_alerts(cid)
     if data=="add":
-        if len(db.places(cid))>=MAX_PLACES: return await say(cid,"Можна зберегти до 5 адрес.",main_keyboard())
+        if len(db.places(cid))>=MAX_PLACES: return await say(cid,"Можна зберегти до 5 адрес.",main_keyboard(cid))
         db.session(cid,"addname")
         return await say(cid,"Напишіть назву адреси: Дім, Батьки, Робота… До 40 символів. Точна адреса не потрібна. Скасувати: /cancel.")
     if action in ("day","image") and len(parts)==2 and parts[1] in ("0","1"):
@@ -769,21 +892,21 @@ async def callbacks(cb: CallbackQuery):
         if not p: return await show_places(cid)
         offset=int(parts[1])
         if action=="image": return await send_chart(cid,offset)
-        return await say(cid,day_text(p,offset),buttons([[("🖼 Картинка",f"image:{offset}")],[("⬅️ Меню","home")]]))
+        return await say(cid,day_text(p,offset),graph_keyboard(offset))
     if action=="sqnew" and len(parts)==2 and parts[1] in SUBQUEUES:
         state=db.session(cid)
-        if not state or state["kind"]!="addqueue": return await say(cid,"Цей вибір уже завершено. Відкрийте «Мої адреси».",main_keyboard())
+        if not state or state["kind"]!="addqueue": return await say(cid,"Цей вибір уже завершено. Відкрийте «Мої адреси».",main_keyboard(cid))
         if len(db.places(cid))>=MAX_PLACES: return await show_places(cid)
         db.add_place(cid,state["payload"]["name"],parts[1])
         db.clear_session(cid)
-        return await say(cid,status_text(cid),main_keyboard())
+        return await say(cid,status_text(cid),main_keyboard(cid))
     if action in ("select","rename","change","removeask","remove","sqchange","notice2","toggle") and len(parts)>=2 and parts[1].isdigit():
         pid=int(parts[1])
         p=db.place(cid,pid)
-        if not p: return await say(cid,"Ця адреса вже недоступна.",main_keyboard())
+        if not p: return await say(cid,"Ця адреса вже недоступна.",main_keyboard(cid))
         if action=="select":
             db.run("UPDATE users SET selected=? WHERE chat_id=?",(pid,cid))
-            return await say(cid,status_text(cid),main_keyboard())
+            return await say(cid,status_text(cid),main_keyboard(cid))
         if action=="rename":
             db.session(cid,"rename",{"pid":pid})
             return await say(cid,"Напишіть нову назву, до 40 символів. Скасувати: /cancel.")
@@ -791,7 +914,7 @@ async def callbacks(cb: CallbackQuery):
         if action=="sqchange" and len(parts)==3 and parts[2] in SUBQUEUES:
             db.run("UPDATE places SET sq=? WHERE id=? AND chat_id=?",(parts[2],pid,cid))
             db.run("UPDATE outbox SET status='cancelled' WHERE place_id=? AND status='pending'",(pid,))
-            return await say(cid,status_text(cid),main_keyboard())
+            return await say(cid,status_text(cid),main_keyboard(cid))
         if action=="removeask":
             return await say(cid,f"Видалити «{p['name']}»?",buttons([[("Видалити",f"remove:{pid}"),("Скасувати","places")]]))
         if action=="remove":
@@ -806,11 +929,11 @@ async def callbacks(cb: CallbackQuery):
             values=set(json.loads(p["notices"]))
             values.remove(notice) if notice in values else values.add(notice)
             db.run("UPDATE places SET notices=? WHERE id=? AND chat_id=?",(jdump(sorted(values)),pid,cid))
-            return await show_settings(cid)
+            return await show_alerts(cid)
         if action=="toggle" and len(parts)==3 and parts[2] in ("updates","off_alert","on_alert","enabled"):
             field=parts[2] # Whitelisted SQL identifier; values remain bound parameters.
             db.run(f"UPDATE places SET {field}=1-{field} WHERE id=? AND chat_id=?",(pid,cid))
-            return await show_settings(cid)
+            return await show_alerts(cid)
     if data=="reports":
         p=db.place(cid)
         if not p: return await show_places(cid)
@@ -821,9 +944,9 @@ async def callbacks(cb: CallbackQuery):
         if not p: return await show_places(cid)
         last=db.one("SELECT * FROM reports WHERE chat_id=? AND sq=?",(cid,p["sq"]))
         if last and now_ts()-last["created"]<30:
-            return await say(cid,"Повідомлення вже враховано. Оновити його можна через 30 секунд.",main_keyboard())
+            return await say(cid,"Повідомлення вже враховано. Оновити його можна через 30 секунд.",main_keyboard(cid))
         db.run("INSERT INTO reports VALUES(?,?,?,?) ON CONFLICT(chat_id,sq) DO UPDATE SET is_on=excluded.is_on,created=excluded.created",(cid,p["sq"],int(parts[2]),now_ts()))
-        return await say(cid,"Дякую! Повідомлення враховується протягом 10 хвилин.\n\n"+report_summary(p["sq"]),main_keyboard())
+        return await say(cid,"Дякую! Повідомлення враховується протягом 10 хвилин.\n\n"+report_summary(p["sq"]),main_keyboard(cid))
     if action=="admin" and len(parts)==2:
         if cid==ADMIN_ID: return await admin_action(cid,parts[1])
         return
@@ -845,7 +968,7 @@ async def callbacks(cb: CallbackQuery):
         return await say(cid,f"✅ У чергу додано {len(targets)} повідомлень. Доставка відбувається поступово.",admin_keyboard())
     if data=="deleteconfirm":
         with db.conn:
-            for table in ("places","outbox","reports","sessions","drafts","feedback"):
+            for table in ("places","outbox","reports","sessions","drafts","feedback","ui_cards"):
                 db.conn.execute(f"DELETE FROM {table} WHERE chat_id=?",(cid,))
             db.conn.execute("DELETE FROM users WHERE chat_id=?",(cid,))
         return await say(cid,"Ваші дані видалено з робочої бази. Резервні копії зберігаються до 14 днів. Почати заново: /start.")
@@ -857,17 +980,17 @@ async def callbacks(cb: CallbackQuery):
             db.run("UPDATE outbox SET status='cancelled' WHERE place_id=? AND status='pending'",(p["id"],))
         else: db.add_place(cid,"Дім",parts[1])
         db.run("UPDATE users SET subscribed=1 WHERE chat_id=?",(cid,))
-        return await say(cid,status_text(cid),main_keyboard())
+        return await say(cid,status_text(cid),main_keyboard(cid))
     if action=="notice" and len(parts)==2 and parts[1].isdigit() and int(parts[1]) in NOTICES:
         p=db.place(cid)
         if p: db.run("UPDATE places SET notices=? WHERE id=?",(jdump([int(parts[1])]),p["id"]))
-        return await show_settings(cid)
+        return await show_alerts(cid)
     if action=="main" and len(parts)==2:
-        if parts[1]=="notice": return await show_settings(cid)
+        if parts[1]=="notice": return await show_alerts(cid)
         if parts[1]=="change": return await show_places(cid)
         if parts[1]=="stop": db.run("UPDATE users SET subscribed=0 WHERE chat_id=?",(cid,))
-        return await say(cid,status_text(cid),main_keyboard())
-    await say(cid,"Кнопка застаріла. Відкрийте актуальне меню.",main_keyboard())
+        return await say(cid,status_text(cid),main_keyboard(cid))
+    await say(cid,"Кнопка застаріла. Відкрийте актуальне меню.",main_keyboard(cid))
 
 @dp.errors()
 async def handler_error(event):
@@ -893,7 +1016,7 @@ async def main():
               ("schedule","Графік на сьогодні"),("notice","Налаштування сповіщень"),
               ("stop","Вимкнути сповіщення"),("about","Про бота та підтримка"),("feedback","Написати відгук")]])
         tasks=[asyncio.create_task(fn(),name=fn.__name__) for fn in (site_loop,reminder_loop,outbox_loop,maintenance_loop)]
-        log.info("Light bot v2 started; users=%s",db.one("SELECT COUNT(*) n FROM users")["n"])
+        log.info("Light bot v2.1 started; users=%s",db.one("SELECT COUNT(*) n FROM users")["n"])
         await dp.start_polling(bot)
     finally:
         for task in tasks: task.cancel()
@@ -903,6 +1026,7 @@ async def main():
 
 if __name__=="__main__":
     asyncio.run(main())
+
 
 
 
