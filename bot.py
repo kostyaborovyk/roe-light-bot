@@ -246,6 +246,20 @@ def main_keyboard(cid=None):
         p=db.place(cid)
         rows.insert(0,[(f"🏠 {p['name'][:30]} ▾","switchplace")])
     return buttons(rows)
+def with_home(markup=None):
+    if markup is None:
+        return buttons([[("🏠 На головну","home")]])
+    markup=markup.model_copy(deep=True)
+    actions={b.callback_data for row in markup.inline_keyboard for b in row}
+    if {"graph","reports","settings"}<=actions:
+        return markup
+    if "home" in actions:
+        for row in markup.inline_keyboard:
+            for button in row:
+                if button.callback_data=="home": button.text="🏠 На головну"
+    else:
+        markup.inline_keyboard.append([InlineKeyboardButton(text="🏠 На головну",callback_data="home")])
+    return markup
 async def api_call(method, cid, **kwargs):
     global last_delivery
     async with delivery_lock:
@@ -278,6 +292,7 @@ async def deliver_ui(cid,text,markup,revision):
 
 async def say(cid,text,markup=None):
     text=text[:4000]
+    markup=with_home(markup)
     async with ui_locks.setdefault(cid,asyncio.Lock()):
         revision=secrets.token_hex(8)
         db.run("INSERT INTO ui_cards(chat_id,revision) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET revision=excluded.revision",(cid,revision))
@@ -699,7 +714,7 @@ async def send_chart(cid,offset):
         png=await asyncio.to_thread(render_chart,p,payload,fetched,offset,marker)
         await api_call("send_photo",cid,photo=BufferedInputFile(png,filename=f"schedule-{p['sq']}.png"),
           caption=f"🏠 {p['name']} · {p['sq']}"+("\n"+marker if marker else ""),
-          reply_markup=buttons([[("← До графіка",f"graph:{offset}")]]))
+          reply_markup=with_home(buttons([[("← До графіка",f"graph:{offset}")]])))
     except TelegramForbiddenError: db.run("UPDATE users SET blocked=1 WHERE chat_id=?",(cid,))
     except (OSError,TelegramRetryAfter,TelegramNetworkError,TelegramServerError,TelegramBadRequest):
         log.warning("Chart unavailable")
