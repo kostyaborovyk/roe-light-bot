@@ -33,7 +33,7 @@ PREALERT_WINDOW_SECONDS = 120           # 2 хв вікно
 DEFAULT_NOTICE_MINUTES = 10
 ALLOWED_NOTICE = {5, 10, 30}
 
-STATE_FILE = "state.json"
+STATE_FILE = "/var/data/state.json"
 
 # Парсинг
 TIME_RANGE_RE = re.compile(r"(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})")
@@ -844,3 +844,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
