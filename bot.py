@@ -1,6 +1,9 @@
 """ROE light bot v2. Run with Python 3.10+; credentials come from environment."""
 import asyncio
 import contextlib
+import functools
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -17,7 +20,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile, BotCommand
+from aiogram.types import Message, CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile, BotCommand
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
@@ -72,11 +75,15 @@ class Store:
         CREATE TABLE IF NOT EXISTS drafts(token TEXT PRIMARY KEY,chat_id INTEGER NOT NULL,target TEXT NOT NULL,text TEXT NOT NULL,expires INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS ui_cards(chat_id INTEGER PRIMARY KEY,message_id INTEGER,revision TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS feedback(id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL,text TEXT NOT NULL,created INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS growth_days(day TEXT PRIMARY KEY,start_total INTEGER NOT NULL,start_active INTEGER NOT NULL,end_total INTEGER NOT NULL,end_active INTEGER NOT NULL,partial INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS growth_events(day TEXT NOT NULL,person TEXT NOT NULL,kind TEXT NOT NULL,PRIMARY KEY(day,person,kind));
+        CREATE TABLE IF NOT EXISTS growth_activated(person TEXT PRIMARY KEY);
         """)
         try:
             self.migrate(legacy)
             # Public Telegram names are not needed for notifications.
             self.run("UPDATE users SET name='' WHERE name<>''")
+            self.init_growth()
         except Exception:
             self.conn.close()
             raise
@@ -91,6 +98,60 @@ class Store:
         return r["value"] if r else default
     def set_meta(self, key, value):
         self.run("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+    def growth_person(self,cid):
+        return hmac.new(self.get_meta("growth_salt").encode(),str(cid).encode(),hashlib.sha256).hexdigest()
+    def growth_state(self,cid):
+        u=self.one("SELECT subscribed,blocked FROM users WHERE chat_id=?",(cid,))
+        if not u: return None
+        p=self.one("SELECT id FROM places WHERE chat_id=? AND enabled=1 AND (updates=1 OR ((off_alert=1 OR on_alert=1) AND notices<>'[]')) LIMIT 1",(cid,))
+        return {**u,"active":bool(u["subscribed"] and not u["blocked"] and p)}
+    def growth_counts(self):
+        total=self.one("SELECT COUNT(*) n FROM users")["n"]
+        active=self.one("SELECT COUNT(*) n FROM users u WHERE u.subscribed=1 AND u.blocked=0 AND EXISTS(SELECT 1 FROM places p WHERE p.chat_id=u.chat_id AND p.enabled=1 AND (p.updates=1 OR ((p.off_alert=1 OR p.on_alert=1) AND p.notices<>'[]')))")["n"]
+        return total,active
+    def init_growth(self):
+        if not self.get_meta("growth_started"):
+            with self.conn:
+                self.conn.execute("INSERT INTO meta VALUES('growth_salt',?)",(secrets.token_hex(32),))
+                self.conn.execute("INSERT INTO meta VALUES('growth_started',?)",(str(now_ts()),))
+                for u in self.all("SELECT chat_id FROM users"):
+                    if self.growth_state(u["chat_id"])["active"]:
+                        self.conn.execute("INSERT OR IGNORE INTO growth_activated VALUES(?)",(self.growth_person(u["chat_id"]),))
+        self.growth_day()
+    def growth_day(self):
+        day=local_time().strftime("%Y-%m-%d")
+        if not self.one("SELECT day FROM growth_days WHERE day=?",(day,)):
+            previous=self.one("SELECT * FROM growth_days ORDER BY day DESC LIMIT 1")
+            total,active=self.growth_counts()
+            start_total,start_active=(previous["end_total"],previous["end_active"]) if previous else (total,active)
+            partial=int(day==local_time(int(self.get_meta("growth_started"))).strftime("%Y-%m-%d"))
+            self.run("INSERT OR IGNORE INTO growth_days VALUES(?,?,?,?,?,?)",(day,start_total,start_active,total,active,partial))
+        return day
+    def growth_finish(self,cid,before):
+        day=self.growth_day()
+        after=self.growth_state(cid)
+        person=self.growth_person(cid)
+        kinds=[]
+        if before is None and after is not None: kinds.append("new")
+        if before is not None and after is None: kinds.append("deleted")
+        if after:
+            if before and ((before["subscribed"] and not after["subscribed"]) or
+                           (before["active"] and not after["active"] and not after["blocked"])):
+                kinds.append("muted")
+            if after["blocked"] and (not before or not before["blocked"]): kinds.append("blocked")
+            if after["active"] and (not before or not before["active"]):
+                seen=self.one("SELECT person FROM growth_activated WHERE person=?",(person,))
+                kinds.append("returned" if seen else "activated")
+                self.run("INSERT OR IGNORE INTO growth_activated VALUES(?)",(person,))
+        total,active=self.growth_counts()
+        with self.conn:
+            for kind in kinds: self.conn.execute("INSERT OR IGNORE INTO growth_events VALUES(?,?,?)",(day,person,kind))
+            self.conn.execute("UPDATE growth_days SET end_total=?,end_active=? WHERE day=?",(total,active,day))
+    def mark_blocked(self,cid):
+        self.growth_day()
+        before=self.growth_state(cid)
+        self.run("UPDATE users SET blocked=1 WHERE chat_id=?",(cid,))
+        self.growth_finish(cid,before)
     def migrate(self, legacy):
         if self.get_meta("legacy_imported"): return
         legacy = Path(legacy)
@@ -240,6 +301,7 @@ dp = Dispatcher()
 fetch_lock, delivery_lock = asyncio.Lock(), asyncio.Lock()
 last_delivery, chat_delivery = 0.0, {}
 ui_locks = {}
+growth_locks = {}
 def buttons(rows):
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=c) for t,c in row] for row in rows])
 def main_keyboard(cid=None):
@@ -301,7 +363,7 @@ async def say(cid,text,markup=None):
         try:
             return await deliver_ui(cid,text,markup,revision)
         except TelegramForbiddenError:
-            db.run("UPDATE users SET blocked=1 WHERE chat_id=?",(cid,))
+            db.mark_blocked(cid)
         except (TelegramRetryAfter,TelegramNetworkError,TelegramServerError) as exc:
             if isinstance(exc,TelegramRetryAfter):
                 db.set_meta("telegram_pause",now_ts()+int(exc.retry_after)+1)
@@ -574,8 +636,8 @@ async def deliver_once():
                 text=reminder_text(place,row["event_ts"],row["kind"].split("_",1)[1])
             await api_call("send_message",row["chat_id"],text=text,reply_markup=markup)
     except TelegramForbiddenError:
+        db.mark_blocked(row["chat_id"])
         with db.conn:
-            db.conn.execute("UPDATE users SET blocked=1 WHERE chat_id=?",(row["chat_id"],))
             db.conn.execute("UPDATE outbox SET status='failed',error='forbidden' WHERE chat_id=? AND status='pending'",(row["chat_id"],))
     except TelegramRetryAfter as exc:
         db.set_meta("telegram_pause",now_ts()+int(exc.retry_after)+1)
@@ -673,16 +735,17 @@ def queue_keyboard(prefix):
 
 def admin_keyboard():
     return buttons([[("📊 Статистика","admin:stats"),("🩺 Стан бота","admin:health")],
+      [("📈 Зростання","growth:1")],
       [("📣 Розсилка","admin:broadcast"),("💾 Резервна копія","admin:backup")],
       [("✍️ Відгуки","admin:feedback"),("🔄 Перевірити сайт","admin:force")],
       [("⬅️ Головне меню","home")]])
 
 def stats_text():
     total=db.one("SELECT COUNT(*) n FROM users")["n"]
-    active=db.one("SELECT COUNT(DISTINCT u.chat_id) n FROM users u JOIN places p ON p.chat_id=u.chat_id WHERE u.subscribed=1 AND u.blocked=0 AND p.enabled=1")["n"]
+    _,active=db.growth_counts()
     blocked=db.one("SELECT COUNT(*) n FROM users WHERE blocked=1")["n"]
-    week=db.one("SELECT COUNT(*) n FROM users WHERE created>=?",(now_ts()-7*86400,))["n"]
-    lines=[f"📊 Користувачів: {total}",f"🔔 Активні підписники: {active}",f"📍 Адрес: {db.one('SELECT COUNT(*) n FROM places')['n']}",f"🚫 Заблокували бота: {blocked}",f"Нових за 7 днів: {week} (дата для старих користувачів — дата перенесення)",""]
+    week=db.one("SELECT COUNT(DISTINCT person) n FROM growth_events WHERE kind='new' AND day>=?",((local_time().date()-timedelta(days=6)).isoformat(),))["n"]
+    lines=[f"📊 Користувачів: {total}",f"🔔 Активні підписники: {active}",f"📍 Підписів підчерг: {db.one('SELECT COUNT(*) n FROM places')['n']}",f"🚫 Заблокували бота: {blocked}",f"Нових за 7 днів: {week} (облік із {stamp(int(db.get_meta('growth_started')))})",""]
     for r in db.all("SELECT sq,COUNT(*) n FROM places GROUP BY sq ORDER BY sq"):
         lines.append(f"Підчерга {r['sq']}: {r['n']} адрес")
     return "\n".join(lines)
@@ -690,7 +753,7 @@ def stats_text():
 def health_text():
     pending=db.one("SELECT COUNT(*) n FROM outbox WHERE status='pending'")["n"]
     failed=db.one("SELECT COUNT(*) n FROM outbox WHERE status='failed' AND created>?",(now_ts()-86400,))["n"]
-    return (f"🩺 Бот v2.1\nОстання перевірка: {stamp(int(db.get_meta('last_good','0')))}\n"
+    return (f"🩺 Бот v2.2\nОстання перевірка: {stamp(int(db.get_meta('last_good','0')))}\n"
       f"Послідовних помилок сайту: {db.get_meta('site_failures','0')}\n"
       f"Повідомлень у черзі: {pending}\nНевдалих доставок за добу: {failed}\n"
       f"Остання щоденна копія: {db.get_meta('last_backup','ще немає')}\n"
@@ -719,7 +782,7 @@ async def send_chart(cid,offset):
         await api_call("send_photo",cid,photo=BufferedInputFile(png,filename=f"schedule-{p['sq']}.png"),
           caption=f"🏠 {p['name']} · {p['sq']}"+("\n"+marker if marker else ""),
           reply_markup=with_home(buttons([[("← До графіка",f"graph:{offset}")]])))
-    except TelegramForbiddenError: db.run("UPDATE users SET blocked=1 WHERE chat_id=?",(cid,))
+    except TelegramForbiddenError: db.mark_blocked(cid)
     except (OSError,TelegramRetryAfter,TelegramNetworkError,TelegramServerError,TelegramBadRequest):
         log.warning("Chart unavailable")
         await say(cid,"⚠️ Картинка зараз недоступна. Надсилаю текстовий графік.\n\n"+day_text(p,offset),main_keyboard(cid))
@@ -733,6 +796,84 @@ def recipients(target):
         params=(target,)
     return db.all(sql+")",params)
 
+def track_growth(handler):
+    @functools.wraps(handler)
+    async def wrapped(event,*args,**kwargs):
+        cid=event.from_user.id if isinstance(event,CallbackQuery) else event.chat.id
+        async with growth_locks.setdefault(cid,asyncio.Lock()):
+            db.growth_day()
+            before=db.growth_state(cid)
+            try:
+                return await handler(event,*args,**kwargs)
+            finally:
+                try: db.growth_finish(cid,before)
+                except Exception: log.exception("Growth tracking failed")
+    return wrapped
+
+def growth_text(days=1,end=None):
+    end=end or local_time().date()
+    start=end-timedelta(days=days-1)
+    first,last=start.isoformat(),end.isoformat()
+    rows=db.all("SELECT * FROM growth_days WHERE day BETWEEN ? AND ? ORDER BY day",(first,last))
+    if not rows: return "📈 Зростання\nЗа цей період ще немає даних."
+    counts={r["kind"]:r["n"] for r in db.all("SELECT kind,COUNT(DISTINCT person) n FROM growth_events WHERE day BETWEEN ? AND ? GROUP BY kind",(first,last))}
+    configured=db.one("SELECT COUNT(DISTINCT n.person) n FROM growth_events n JOIN growth_events a ON n.person=a.person AND a.kind='activated' WHERE n.kind='new' AND n.day BETWEEN ? AND ? AND a.day BETWEEN ? AND ?",(first,last,first,last))["n"]
+    delta=rows[-1]["end_active"]-rows[0]["start_active"]
+    title=f"Звіт за {end:%d.%m.%Y}" if days==1 else f"Зростання · {start:%d.%m}–{end:%d.%m.%Y}"
+    lines=[f"📊 {title}","",f"👥 Користувачів у базі: {rows[-1]['end_total']}",
+           f"🔔 Отримують сповіщення: {rows[-1]['end_active']}",f"📈 Зміна активних: {delta:+d}","",
+           f"🆕 Нових користувачів: {counts.get('new',0)}",f"✅ Із них налаштували сповіщення: {configured}",
+           f"🔕 Вимкнули всі сповіщення: {counts.get('muted',0)}",f"🚫 Заблокували бота: {counts.get('blocked',0)}",
+           f"↩️ Повернулися до сповіщень: {counts.get('returned',0)}",f"🗑 Видалили дані: {counts.get('deleted',0)}"]
+    # Current-day totals are live; previous-day reports use their saved closing totals.
+    if days==1 and end==local_time().date(): lines.append("\nСьогодні — стан на зараз.")
+    observed=local_time(int(db.get_meta("growth_started")))
+    if rows[0]["partial"] or rows[0]["day"]>first:
+        lines.append(f"\nОблік із {observed:%d.%m.%Y %H:%M}; період неповний.")
+    if days>1: lines.append("Лічильники дій — унікальні люди за період; одна людина може бути в кількох рядках.")
+    return "\n".join(lines)
+
+async def show_growth(cid,days=1):
+    if cid!=ADMIN_ID: return
+    db.growth_day()
+    total,active=db.growth_counts()
+    db.run("UPDATE growth_days SET end_total=?,end_active=? WHERE day=?",(total,active,local_time().strftime("%Y-%m-%d")))
+    await say(cid,growth_text(days),buttons([[("Сьогодні","growth:1"),("7 днів","growth:7"),("30 днів","growth:30")],[("← Адмінменю","admin:growthback")]]))
+
+def queue_daily_growth():
+    today=db.growth_day()
+    total,active=db.growth_counts()
+    db.run("UPDATE growth_days SET end_total=?,end_active=? WHERE day=?",(total,active,today))
+    now=local_time()
+    if not ADMIN_ID or now.hour<9: return
+    yesterday=now.date()-timedelta(days=1)
+    day=yesterday.isoformat()
+    if not db.one("SELECT day FROM growth_days WHERE day=?",(day,)): return
+    if db.one("SELECT id FROM outbox WHERE dedupe=?",(f"admin-daily:{day}:{ADMIN_ID}",)): return
+    start=(yesterday-timedelta(days=6)).isoformat()
+    week=db.all("SELECT * FROM growth_days WHERE day BETWEEN ? AND ? ORDER BY day",(start,day))
+    new_week=db.one("SELECT COUNT(DISTINCT person) n FROM growth_events WHERE kind='new' AND day BETWEEN ? AND ?",(start,day))["n"]
+    change=week[-1]["end_active"]-week[0]["start_active"]
+    text=growth_text(1,yesterday)+f"\n\nЗа останні 7 днів:\n🆕 Нових користувачів: {new_week}\n📈 Зміна активних: {change:+d}"
+    if week[0]["partial"] or week[0]["day"]>start: text+="\nТиждень: дані від початку обліку."
+    db.enqueue(ADMIN_ID,text,kind="admin_daily",dedupe=f"admin-daily:{day}:{ADMIN_ID}",expires=int((now+timedelta(days=1)).timestamp()),
+               markup=buttons([[("📈 Зростання","growth:7")]]))
+
+async def growth_loop():
+    while True:
+        try: queue_daily_growth()
+        except asyncio.CancelledError: raise
+        except Exception: log.exception("Daily growth report failed")
+        await asyncio.sleep(60)
+
+@dp.my_chat_member()
+@track_growth
+async def membership_changed(event: ChatMemberUpdated):
+    if event.chat.type!="private" or not db.growth_state(event.chat.id): return
+    status=event.new_chat_member.status
+    if status in ("kicked","member"):
+        db.run("UPDATE users SET blocked=? WHERE chat_id=?",(int(status=="kicked"),event.chat.id))
+
 async def broadcast_preview(cid,target,text):
     if cid!=ADMIN_ID: return
     if not text.strip() or len(text)>3000: return await say(cid,"Текст має містити від 1 до 3000 символів.")
@@ -745,6 +886,7 @@ async def broadcast_preview(cid,target,text):
 async def admin_action(cid,action):
     if cid!=ADMIN_ID: return
     if action=="stats": await say(cid,stats_text(),admin_keyboard())
+    elif action=="growthback": await say(cid,"Керування ботом",admin_keyboard())
     elif action=="health": await say(cid,health_text(),admin_keyboard())
     elif action=="broadcast":
         rows=[[("Усі активні підписники","bctarget:all")]]
@@ -778,6 +920,7 @@ async def admin_action(cid,action):
             await say(cid,"⚠️ Сайт недоступний або таблицю не вдалося розібрати. Останні дані збережено.",admin_keyboard())
 
 @dp.message(F.text)
+@track_growth
 async def messages(message: Message):
     if message.chat.type!="private": return
     cid=message.chat.id
@@ -857,6 +1000,7 @@ async def messages(message: Message):
     else: await say(cid,"Оберіть підчергу кнопкою або скасуйте дію командою /cancel.")
 
 @dp.callback_query()
+@track_growth
 async def callbacks(cb: CallbackQuery):
     if not isinstance(cb.message,Message) or cb.message.chat.type!="private" or cb.message.chat.id!=cb.from_user.id:
         with contextlib.suppress(TelegramBadRequest): await cb.answer("Відкрийте приватний чат із ботом.",show_alert=True)
@@ -867,6 +1011,9 @@ async def callbacks(cb: CallbackQuery):
     data=cb.data or ""
     parts=data.split(":")
     action=parts[0]
+    if action=="growth" and len(parts)==2 and parts[1] in ("1","7","30"):
+        if cid==ADMIN_ID: return await show_growth(cid,int(parts[1]))
+        return
     if action in ("open","graph") or cb.message.photo:
         # Opening a schedule from a notification never edits that notification.
         if action=="open" or cb.message.photo:
@@ -1036,8 +1183,8 @@ async def main():
               ("start","Почати / увімкнути сповіщення"),("status","Поточний стан"),
               ("schedule","Графік на сьогодні"),("notice","Налаштування сповіщень"),
               ("stop","Вимкнути сповіщення"),("about","Про бота та підтримка"),("feedback","Написати відгук")]])
-        tasks=[asyncio.create_task(fn(),name=fn.__name__) for fn in (site_loop,reminder_loop,outbox_loop,maintenance_loop)]
-        log.info("Light bot v2.1 started; users=%s",db.one("SELECT COUNT(*) n FROM users")["n"])
+        tasks=[asyncio.create_task(fn(),name=fn.__name__) for fn in (site_loop,reminder_loop,outbox_loop,maintenance_loop,growth_loop)]
+        log.info("Light bot v2.2 started; users=%s",db.one("SELECT COUNT(*) n FROM users")["n"])
         await dp.start_polling(bot)
     finally:
         for task in tasks: task.cancel()
