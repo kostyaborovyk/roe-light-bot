@@ -3,18 +3,26 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
 from core import ACCOUNTS, CATEGORIES, Store, amount, journal_row, new_draft, reminder_due
 from sheets import Sheets
 
 TZ = ZoneInfo("Europe/Kyiv")
 log = logging.getLogger("budget")
+CATEGORY_LABELS = ['🏠 Оренда', '💳 Розстрочки', '📱 Зв’язок', '🔔 Підписки',
+                   '🛒 Продукти', '☕ Кафе', '🎬 Розваги', '🚕 Транспорт',
+                   '🧴 Побут', '💊 Здоров’я', '👕 Одяг', '💆 Масаж',
+                   '🎁 Подарунки', '🤝 Благодійність', '📦 Інше']
+ACCOUNT_LABELS = ['Mono картка', 'Mono банка', 'Приват зарплата', 'Приват кредит',
+                  'ПУМБ', 'Сільпо банк', 'Готівка', 'Інше']
 
 
 def keyboard(rows):
@@ -25,13 +33,15 @@ def keyboard(rows):
 def menu():
     return keyboard([[('➖ Витрата', 'new:expense:today'), ('➕ Надходження', 'new:income:today')],
                      [('🔁 Переказ', 'new:transfer:today'), ('📊 Залишки', 'summary')],
-                     [('📅 Витрата за вчора', 'new:expense:yesterday')],
+                     [('📅 За вчора', 'new:expense:yesterday'), ('📈 Категорії', 'categories')],
                      [('🔔 Увімкнути нагадування', 'reminders:on'), ('🔕 Вимкнути', 'reminders:off')]])
 
 
 def choice(draft, action, values):
-    return keyboard([[(text, f'd:{draft["id"]}:{action}:{i}')] for i, text in enumerate(values)]
-                    + [[('Скасувати', f'd:{draft["id"]}:cancel:0')]])
+    labels = CATEGORY_LABELS if action == 'category' else ACCOUNT_LABELS
+    buttons = [(labels[i], f'd:{draft["id"]}:{action}:{i}') for i in range(len(values))]
+    return keyboard([buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+                    + [[('✖ Скасувати', f'd:{draft["id"]}:cancel:0')]])
 
 
 class BudgetBot:
@@ -86,6 +96,36 @@ class BudgetBot:
                 log.warning('Summary failed: %s', type(exc).__name__)
                 await message.answer('Не вдалося прочитати таблицю. Спробуй трохи пізніше.')
 
+    async def show(self, message, text, markup=None, draft=None):
+        """Keep one editable operation card, including after typed replies/restarts."""
+        card = draft.get('card_id') if draft else None
+        if card:
+            try:
+                await message.bot.edit_message_text(text, chat_id=self.owner,
+                                                    message_id=card, reply_markup=markup)
+                return
+            except TelegramBadRequest as exc:
+                if 'message is not modified' in str(exc).lower():
+                    return
+                # Old/deleted cards cannot always be edited; replace them.
+            except RuntimeError:
+                # Unbound Message objects in offline tests.
+                pass
+        sent = await message.answer(text, reply_markup=markup)
+        if draft is not None and isinstance(sent, Message):
+            draft['card_id'] = sent.message_id
+            self.store.save_draft(self.owner, draft)
+
+    async def description(self, message, draft):
+        if 'description' in draft:
+            await self.review(message, draft)
+            return
+        draft['step'] = 'description'
+        self.store.save_draft(self.owner, draft)
+        await self.show(message, 'Додай короткий опис або пропусти цей крок.', keyboard([
+            [('Без опису →', f'd:{draft["id"]}:skip:0')],
+            [('✖ Скасувати', f'd:{draft["id"]}:cancel:0')]]), draft)
+
     async def review(self, message, draft):
         row = journal_row(draft, self.year, self.month)
         text = (f'Перевір запис:\n{draft["date"]} · {row[1]}\n{row[4]:.2f} грн\n'
@@ -93,9 +133,9 @@ class BudgetBot:
                 + (f' → {row[6]}' if row[6] else '') + f'\n{row[3]}')
         draft['step'] = 'confirm'
         self.store.save_draft(self.owner, draft)
-        await message.answer(text, reply_markup=keyboard([
+        await self.show(message, text, keyboard([
             [('✅ Зберегти', f'd:{draft["id"]}:confirm:0')],
-            [('❌ Скасувати', f'd:{draft["id"]}:cancel:0')]]))
+            [('❌ Скасувати', f'd:{draft["id"]}:cancel:0')]]), draft)
 
     async def callback(self, callback: CallbackQuery):
         if not self.allowed(callback):
@@ -105,9 +145,10 @@ class BudgetBot:
         msg = callback.message
         data = callback.data
         try:
-            if data == 'summary':
+            if data in {'summary', 'categories'}:
                 async with self.lock:
-                    text = await asyncio.to_thread(self.sheets.summary)
+                    text = await asyncio.to_thread(self.sheets.summary if data == 'summary'
+                                                   else self.sheets.categories_summary)
                 await msg.answer(text, reply_markup=menu())
                 return
             if data.startswith('reminders:'):
@@ -125,7 +166,9 @@ class BudgetBot:
                     raise ValueError('Є незавершений запис. Спершу заверши його або /cancel.')
                 draft = new_draft(kinds[kind], day)
                 self.store.save_draft(self.owner, draft)
-                await msg.answer(f'{draft["kind"]}, дата {day:%d.%m.%Y}.\nВведи суму, наприклад 125,50.')
+                await self.show(msg, f'{draft["kind"]} · {day:%d.%m.%Y}\n'
+                                'Введи суму: 125,50\nАбо суму й опис: 125,50 продукти',
+                                keyboard([[('✖ Скасувати', f'd:{draft["id"]}:cancel:0')]]), draft)
                 return
             prefix, token, action, index = data.split(':')
             draft = self.store.draft(self.owner)
@@ -134,7 +177,8 @@ class BudgetBot:
                 return
             if action == 'cancel':
                 self.store.clear_draft(self.owner)
-                await msg.answer('Чернетку скасовано.', reply_markup=menu())
+                await self.show(msg, 'Чернетку скасовано.', menu(), draft)
+                self.store.clear_draft(self.owner)
                 return
             i = int(index)
             if action == 'category' and draft['step'] == 'category':
@@ -142,7 +186,8 @@ class BudgetBot:
                     raise ValueError('Невідома категорія.')
                 draft.update(category=CATEGORIES[i], step='account')
                 self.store.save_draft(self.owner, draft)
-                await msg.answer('Обери рахунок:', reply_markup=choice(draft, 'account', ACCOUNTS))
+                await self.show(msg, f'{draft["amount"]} грн · {draft["category"]}\nОбери рахунок:',
+                                choice(draft, 'account', ACCOUNTS), draft)
             elif action == 'account' and draft['step'] == 'account':
                 if not 0 <= i < len(ACCOUNTS):
                     raise ValueError('Невідомий рахунок.')
@@ -150,17 +195,17 @@ class BudgetBot:
                 if draft['kind'] == 'Переказ':
                     draft['step'] = 'target'
                     self.store.save_draft(self.owner, draft)
-                    await msg.answer('Куди переказуєш?', reply_markup=choice(draft, 'target', ACCOUNTS))
+                    await self.show(msg, 'Куди переказуєш?', choice(draft, 'target', ACCOUNTS), draft)
                 else:
-                    draft['step'] = 'description'
-                    self.store.save_draft(self.owner, draft)
-                    await msg.answer('Короткий опис покупки/надходження. Без опису — надішли «-».')
+                    await self.description(msg, draft)
             elif action == 'target' and draft['step'] == 'target':
                 if not 0 <= i < len(ACCOUNTS) or ACCOUNTS[i] == draft['account']:
                     raise ValueError('Обери інший рахунок отримувача.')
-                draft.update(target=ACCOUNTS[i], step='description')
-                self.store.save_draft(self.owner, draft)
-                await msg.answer('Короткий опис переказу. Без опису — «-».')
+                draft.update(target=ACCOUNTS[i])
+                await self.description(msg, draft)
+            elif action == 'skip' and draft['step'] == 'description':
+                draft['description'] = ''
+                await self.review(msg, draft)
             elif action == 'confirm' and draft['step'] == 'confirm':
                 payload = journal_row(draft, self.year, self.month)
                 async with self.lock:
@@ -170,10 +215,13 @@ class BudgetBot:
                         number = await asyncio.to_thread(self.store.commit, token, self.sheets)
                     except Exception as exc:
                         log.warning('Journal write pending: %s', type(exc).__name__)
-                        await msg.answer('Запис підтверджено й збережено в черзі. Google ще не підтвердив '
-                                         'внесення. Бот повторить перевірку; не вводь цю операцію знову.')
+                        await self.show(msg, 'Запис підтверджено й збережено в черзі. Google ще не підтвердив '
+                                        'внесення. Бот повторить перевірку; не вводь цю операцію знову.', menu(), draft)
+                        self.store.clear_draft(self.owner)
                         return
-                await msg.answer(f'✅ Збережено в «Журнал», рядок {number}.', reply_markup=menu())
+                await self.show(msg, f'✅ Збережено: {draft["amount"]} грн\n'
+                                f'{draft.get("category", draft["kind"])} · {draft["account"]}', menu(), draft)
+                self.store.clear_draft(self.owner)
             else:
                 await msg.answer('Ця кнопка вже не відповідає поточному кроку.')
         except ValueError as exc:
@@ -202,15 +250,26 @@ class BudgetBot:
                 if draft['step'] == 'confirm':
                     await self.review(message, draft)
             elif draft['step'] == 'amount':
-                draft['amount'] = amount(message.text)
+                try:
+                    draft['amount'] = amount(message.text)
+                except ValueError:
+                    match = re.fullmatch(r'\s*(\d+(?:[.,]\d{1,2})?)\s+([^\d\s].*)', message.text)
+                    if not match:
+                        raise
+                    draft['amount'] = amount(match[1])
+                    draft['description'] = match[2].strip()
+                    if len(draft['description']) > 300:
+                        raise ValueError('Опис має бути до 300 символів.')
                 if draft['kind'] == 'Витрата':
                     draft['step'] = 'category'
                     self.store.save_draft(self.owner, draft)
-                    await message.answer('Обери категорію:', reply_markup=choice(draft, 'category', CATEGORIES))
+                    await self.show(message, f'{draft["amount"]} грн · обери категорію:',
+                                    choice(draft, 'category', CATEGORIES), draft)
                 else:
                     draft['step'] = 'account'
                     self.store.save_draft(self.owner, draft)
-                    await message.answer('Обери рахунок:', reply_markup=choice(draft, 'account', ACCOUNTS))
+                    await self.show(message, f'{draft["amount"]} грн · обери рахунок:',
+                                    choice(draft, 'account', ACCOUNTS), draft)
             elif draft['step'] == 'description':
                 draft['description'] = '' if message.text.strip() == '-' else message.text.strip()
                 await self.review(message, draft)

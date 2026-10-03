@@ -4,6 +4,12 @@ from urllib.parse import quote
 from core import HEADER, ACCOUNTS, CATEGORIES
 
 
+def spent_percent(spent, limit):
+    if limit > 0:
+        return f'{spent / limit * 100:.1f}%'
+    return 'без ліміту' if spent > 0 else '—'
+
+
 class Sheets:
     def __init__(self, spreadsheet_id, credentials_json, main_tab):
         from google.oauth2.service_account import Credentials
@@ -88,8 +94,28 @@ class Sheets:
         return (f"📊 {self.main_tab}\nОпераційно: {n(1, 1):,.2f} грн\n"
                 f"Банка: {n(2, 1):,.2f} грн\nЛіміти: {n(1, 4):,.2f} грн\n"
                 f"Надходження: {n(3, 1):,.2f} грн\nВитрати: {n(4, 1):,.2f} грн\n"
+                f"Використано бюджету: {spent_percent(n(4, 1), n(1, 4))}\n"
+                f"Залишок лімітів: {n(1, 4) - n(4, 1):,.2f} грн\n"
                 f"Нерозподілено: {n(2, 4):,.2f} грн\n"
                 f"Мені винні: {n(5, 1):,.2f} грн — поза ресурсом бюджету.")
+
+    def categories_summary(self):
+        name = self.main_tab.replace("'", "''")
+        rows = self.values(f"'{name}'!B16:E30")
+        lines = [f'📈 {self.main_tab} · використання лімітів']
+        total_spent = total_limit = 0
+        for row in rows:
+            label = row[0]
+            limit = row[2] if len(row) > 2 and isinstance(row[2], (int, float)) else 0
+            spent = row[3] if len(row) > 3 and isinstance(row[3], (int, float)) else 0
+            total_spent += spent
+            total_limit += limit
+            icon = '🔴' if spent > limit else '🟡' if limit and spent / limit >= .8 else '🟢'
+            lines.append(f'\n{icon} {label} · {spent_percent(spent, limit)}\n'
+                         f'{spent:,.2f} / {limit:,.2f} грн')
+        lines.append(f'\nЗагалом: {total_spent:,.2f} / {total_limit:,.2f} грн · '
+                     f'{spent_percent(total_spent, total_limit)}')
+        return '\n'.join(lines)
 
     def day_expenses(self, day):
         from datetime import date
