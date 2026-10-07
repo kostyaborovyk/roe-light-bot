@@ -13,6 +13,7 @@ import secrets
 import shutil
 import sqlite3
 import time
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -504,8 +505,16 @@ def render_chart(p,payload,fetched,offset=0,marker=""):
     return output.getvalue()
 
 
-async def refresh_site():
-    async with fetch_lock:
+def fetch_site_snapshot_sync():
+    request=urllib.request.Request(URL,headers={"User-Agent":"ROE-Light-Bot/2.0"})
+    with urllib.request.urlopen(request,timeout=30) as response:
+        raw=response.read(4_000_001)
+        if len(raw)>4_000_000: raise ValueError("Unexpectedly large source page")
+        html=raw.decode(response.headers.get_content_charset() or "utf-8",errors="replace")
+    return parse_schedules(html)
+
+async def fetch_site_snapshot():
+    try:
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "ROE-Light-Bot/2.0"}) as session:
             async with session.get(URL) as response:
@@ -515,7 +524,20 @@ async def refresh_site():
                 raw = await response.content.read(4_000_001)
                 if len(raw)>4_000_000: raise ValueError("Unexpectedly large source page")
                 html = raw.decode(response.charset or "utf-8", errors="replace")
-        marker, schedules = await asyncio.to_thread(parse_schedules, html)
+        return await asyncio.to_thread(parse_schedules, html)
+    except asyncio.CancelledError: raise
+    except (aiohttp.ClientError,TimeoutError,ValueError,LookupError) as primary:
+        log.warning("Primary site fetch failed: %s: %s; trying fallback",type(primary).__name__,str(primary))
+        try:
+            result=await asyncio.to_thread(fetch_site_snapshot_sync)
+        except Exception as fallback:
+            raise ValueError(f"Primary fetch: {type(primary).__name__}: {primary}; fallback: {type(fallback).__name__}: {fallback}") from fallback
+        log.info("Site fallback succeeded")
+        return result
+
+async def refresh_site():
+    async with fetch_lock:
+        marker,schedules=await fetch_site_snapshot()
         fetched = now_ts()
         # A single transaction updates both the snapshot and its outgoing change messages.
         with db.conn:
