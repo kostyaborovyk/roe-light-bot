@@ -36,8 +36,11 @@ class Sheets:
     def validate(self):
         meta = self.request("GET", params={"fields": "sheets(properties(sheetId,title,gridProperties))"})
         tabs = {s["properties"]["title"]: s["properties"] for s in meta["sheets"]}
-        if set(tabs) != {self.main_tab, "Журнал", "Борги"}:
-            raise ValueError("Очікуються тільки вкладки місяця, Журнал і Борги.")
+        required = {self.main_tab, "Журнал", "Борги"}
+        missing = required - set(tabs)
+        if missing:
+            raise ValueError("Не знайдено вкладки: " + ", ".join(sorted(missing))
+                             + ". Перевір назви та BUDGET_MONTH_TAB у Render.")
         self.journal_id = tabs["Журнал"]["sheetId"]
         if tabs["Журнал"]["gridProperties"]["rowCount"] < 308:
             raise ValueError("У журналі замало рядків.")

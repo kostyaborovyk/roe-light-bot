@@ -4,18 +4,20 @@ import contextlib
 import logging
 import os
 import re
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
 from core import ACCOUNTS, CATEGORIES, Store, amount, journal_row, new_draft, reminder_due
 from sheets import Sheets
 
 TZ = ZoneInfo("Europe/Kyiv")
+RETRY_SECONDS = 3600
 log = logging.getLogger("budget")
 CATEGORY_LABELS = ['🏠 Оренда', '💳 Розстрочки', '📱 Зв’язок', '🔔 Підписки',
                    '🛒 Продукти', '☕ Кафе', '🎬 Розваги', '🚕 Транспорт',
@@ -97,9 +99,10 @@ class BudgetBot:
                 await message.answer('Не вдалося прочитати таблицю. Спробуй трохи пізніше.')
 
     async def show(self, message, text, markup=None, draft=None):
-        """Keep one editable operation card, including after typed replies/restarts."""
+        """Edit button steps; send typed-reply steps below the user's message."""
         card = draft.get('card_id') if draft else None
-        if card:
+        typed_reply = bool(message.from_user and not message.from_user.is_bot)
+        if card and not typed_reply:
             try:
                 await message.bot.edit_message_text(text, chat_id=self.owner,
                                                     message_id=card, reply_markup=markup)
@@ -115,6 +118,13 @@ class BudgetBot:
         if draft is not None and isinstance(sent, Message):
             draft['card_id'] = sent.message_id
             self.store.save_draft(self.owner, draft)
+        if card and typed_reply:
+            try:
+                await message.bot.edit_message_reply_markup(
+                    chat_id=self.owner, message_id=card, reply_markup=None)
+            except (TelegramAPIError, RuntimeError):
+                # A deleted/unavailable old card must not block the new step.
+                pass
 
     async def description(self, message, draft):
         if 'description' in draft:
@@ -279,18 +289,21 @@ class BudgetBot:
             await message.answer(str(exc))
 
     async def background(self, bot):
+        retry_at = 0.0
         while True:
             try:
-                async with self.lock:
-                    for item in self.store.pending():
-                        try:
-                            number = await asyncio.to_thread(self.store.commit, item['id'], self.sheets)
-                            await bot.send_message(self.owner, f'✅ Запис із черги внесено, рядок {number}.')
-                        except Exception as exc:
-                            log.warning('Pending retry failed: %s', type(exc).__name__)
-                            if isinstance(exc, ValueError) and not self.store.setting('warn:' + item['id']):
-                                await bot.send_message(self.owner, f'⚠️ Запис очікує перевірки: {exc}')
-                                self.store.set_setting('warn:' + item['id'], '1')
+                if time.monotonic() >= retry_at:
+                    retry_at = time.monotonic() + RETRY_SECONDS
+                    async with self.lock:
+                        for item in self.store.pending():
+                            try:
+                                number = await asyncio.to_thread(self.store.commit, item['id'], self.sheets)
+                                await bot.send_message(self.owner, f'✅ Запис із черги внесено, рядок {number}.')
+                            except Exception as exc:
+                                log.warning('Pending retry failed: %s', type(exc).__name__)
+                                if isinstance(exc, ValueError) and not self.store.setting('warn:' + item['id']):
+                                    await bot.send_message(self.owner, f'⚠️ Запис очікує перевірки: {exc}')
+                                    self.store.set_setting('warn:' + item['id'], '1')
                 if self.store.setting('reminders_enabled') == '1':
                     now = datetime.now(TZ)
                     sent = {r[0] for r in self.store.conn.execute('SELECT key FROM reminders')}

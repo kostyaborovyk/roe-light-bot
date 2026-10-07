@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+BUDGET_RESTART_SECONDS = 3600
 
 
 def main():
@@ -41,10 +42,11 @@ def main():
                     proc.kill()
                     proc.wait()
                 break
-            print(f'{name} exited ({proc.returncode}); restarting in {delay}s', flush=True)
             if time.monotonic() - started > 60:
                 delay = 2
-            if stop.wait(delay):
+            wait_seconds = BUDGET_RESTART_SECONDS if name == 'budget' else delay
+            print(f'{name} exited ({proc.returncode}); restarting in {wait_seconds}s', flush=True)
+            if stop.wait(wait_seconds):
                 break
             delay = min(delay * 2, 60)
 
