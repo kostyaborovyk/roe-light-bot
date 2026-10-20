@@ -455,11 +455,15 @@ def day_text(p,offset=0):
     if marker: lines.extend(["",marker])
     return "\n".join(lines)
 
-def full_graph(p,payload,marker):
+def full_graph(p,payload,marker,new_day=False,previous=None):
     today=local_time().date()
-    days=sorted((d for d in set(payload["days"])|set(payload["pending"]) if datetime.strptime(d,"%d.%m.%Y").date()>=today),
+    dates=set(payload["days"])|set(payload["pending"])|set((previous or {}).get("days",{}))
+    days=sorted((d for d in dates if datetime.strptime(d,"%d.%m.%Y").date()>=today),
                 key=lambda d:datetime.strptime(d,"%d.%m.%Y"))
-    lines=[f"🔄 Оновився графік · {p['name']} · {p['sq']}"]
+    today_key=today.strftime("%d.%m.%Y")
+    if today_key not in days: days.insert(0,today_key)
+    heading="📅 Графік на новий день" if new_day else "🔄 Оновився графік"
+    lines=[f"{heading} · {p['name']} · {p['sq']}"]
     for day in days:
         lines.extend([""]+day_lines(payload,day))
     if marker: lines.extend(["",source_update(marker)])
@@ -467,10 +471,13 @@ def full_graph(p,payload,marker):
 
 def schedule_changed(old,new):
     today=local_time().date()
-    # A site outage or a waiting cell is not an explicit cancellation.
-    for day,values in new["days"].items():
+    # Only validated source snapshots reach this comparison. Missing and waiting
+    # both mean unknown, never an assertion that outages have been cancelled.
+    for day in set(old["days"])|set(new["days"]):
         if datetime.strptime(day,"%d.%m.%Y").date()<today: continue
-        if day not in old["days"] or set(map(tuple,values))!=set(map(tuple,old["days"][day])):
+        before=sorted(set(map(tuple,old["days"][day]))) if day in old["days"] else None
+        after=sorted(set(map(tuple,new["days"][day]))) if day in new["days"] else None
+        if before!=after:
             return True
     return False
 def render_chart(p,payload,fetched,offset=0,marker=""):
@@ -539,16 +546,27 @@ async def refresh_site():
     async with fetch_lock:
         marker,schedules=await fetch_site_snapshot()
         fetched = now_ts()
+        day=local_time(fetched).strftime("%Y-%m-%d")
+        last_day=db.get_meta("schedule_day")
+        if not last_day:
+            last_good=int(db.get_meta("last_good","0"))
+            if last_good: last_day=local_time(last_good).strftime("%Y-%m-%d")
+        new_day=bool(last_day and last_day<day)
         # A single transaction updates both the snapshot and its outgoing change messages.
         with db.conn:
             for sq, payload in schedules.items():
                 old, previous = db.schedule(sq)
-                changed = bool(previous and schedule_changed(old,payload))
+                changed = bool(previous and (schedule_changed(old,payload) or new_day))
                 db.conn.execute("INSERT INTO schedules VALUES(?,?,?) ON CONFLICT(sq) DO UPDATE SET payload=excluded.payload,fetched=excluded.fetched", (sq,jdump(payload),fetched))
                 if changed:
+                    key=f"schedule_revision:{sq}"
+                    revision=int(db.get_meta(key,"0"))+1
+                    db.conn.execute("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,str(revision)))
                     for p in db.all("SELECT p.* FROM places p JOIN users u ON u.chat_id=p.chat_id WHERE p.sq=? AND p.enabled=1 AND p.updates=1 AND u.subscribed=1 AND u.blocked=0",(sq,)):
-                        db.enqueue(p["chat_id"],full_graph(p,payload,marker),
-                          kind="update",dedupe=f"change:{p['id']}:{fetched}",pid=p["id"],expires=fetched+3600,markup=buttons([[("📅 Відкрити графік",f"open:{p['id']}")]]))
+                        db.conn.execute("UPDATE outbox SET status='cancelled' WHERE place_id=? AND kind='update' AND status='pending'",(p["id"],))
+                        db.enqueue(p["chat_id"],full_graph(p,payload,marker,new_day,old),
+                          kind="update",dedupe=f"change-v3:{p['id']}:{revision}",pid=p["id"],expires=fetched+3600,markup=buttons([[("📅 Відкрити графік",f"open:{p['id']}")]]))
+            db.conn.execute("INSERT INTO meta VALUES('schedule_day',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(day,))
             db.conn.execute("INSERT INTO meta VALUES('last_good',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(fetched),))
             db.conn.execute("INSERT INTO meta VALUES('marker',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(marker,))
             db.conn.execute("INSERT INTO meta VALUES('site_failures','0') ON CONFLICT(key) DO UPDATE SET value='0'")
@@ -1216,6 +1234,7 @@ async def main():
 
 if __name__=="__main__":
     asyncio.run(main())
+
 
 
 
