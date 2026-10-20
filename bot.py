@@ -556,7 +556,10 @@ async def refresh_site():
         with db.conn:
             for sq, payload in schedules.items():
                 old, previous = db.schedule(sq)
-                changed = bool(previous and (schedule_changed(old,payload) or new_day))
+                # A new date alone does not make an unchanged waiting cell news.
+                # Send the daily card only when today's snapshot has outage hours.
+                daily_graph = bool(new_day and payload["days"].get(local_time(fetched).strftime("%d.%m.%Y")))
+                changed = bool(previous and (schedule_changed(old,payload) or daily_graph))
                 db.conn.execute("INSERT INTO schedules VALUES(?,?,?) ON CONFLICT(sq) DO UPDATE SET payload=excluded.payload,fetched=excluded.fetched", (sq,jdump(payload),fetched))
                 if changed:
                     key=f"schedule_revision:{sq}"
