@@ -30,9 +30,9 @@ def amount(text):
     return str(value.quantize(Decimal("0.01")))
 
 
-def journal_row(draft, year, month):
+def journal_row(draft, year=None, month=None):
     day = date.fromisoformat(draft["date"])
-    if (day.year, day.month) != (year, month):
+    if year is not None and (day.year, day.month) != (year, month):
         raise ValueError("Ця дата не належить місяцю підключеної таблиці.")
     kind = draft["kind"]
     if kind not in ("Витрата", "Надходження", "Переказ"):
@@ -154,7 +154,7 @@ class Store:
             number = next((i for i, (values, marker) in enumerate(rows, 5)
                            if not any(v != "" for v in values) and not marker and i not in reserved), None)
             if number is None:
-                raise ValueError("Журнал до рядка 308 заповнений. Потрібно розширити формули й валідації.")
+                raise ValueError("Журнал заповнений. Додай рядки та перевір охоплення формул і валідацій.")
             with self.conn:
                 self.conn.execute("UPDATE operations SET row_number=? WHERE id=?", (number, token))
         values, marker = sheets.row(number)

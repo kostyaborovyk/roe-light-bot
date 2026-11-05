@@ -1,17 +1,15 @@
 """Write literal cells atomically with an operation note; retain all formatting."""
 import json
+import re
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from core import HEADER, ACCOUNTS, CATEGORIES
-
-
-def spent_percent(spent, limit):
-    if limit > 0:
-        return f'{spent / limit * 100:.1f}%'
-    return 'без ліміту' if spent > 0 else '—'
+from reporting import MONTHS, calculate
 
 
 class Sheets:
-    def __init__(self, spreadsheet_id, credentials_json, main_tab):
+    def __init__(self, spreadsheet_id, credentials_json, main_tab=None):
         from google.oauth2.service_account import Credentials
         from google.auth.transport.requests import AuthorizedSession
         credentials = Credentials.from_service_account_info(
@@ -21,6 +19,8 @@ class Sheets:
         self.main_tab = main_tab
         self.base = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}"
         self.journal_id = None
+        self.journal_last = 308
+        self.today = lambda: datetime.now(ZoneInfo('Europe/Kyiv')).date()
 
     def request(self, method, suffix="", **kwargs):
         response = self.session.request(method, self.base + suffix, timeout=30, **kwargs)
@@ -33,24 +33,72 @@ class Sheets:
         return self.request("GET", "/values/" + quote(range_name, safe=""),
                             params={"valueRenderOption": "UNFORMATTED_VALUE"}).get("values", [])
 
-    def validate(self):
+    def metadata(self):
         meta = self.request("GET", params={"fields": "sheets(properties(sheetId,title,gridProperties))"})
-        tabs = {s["properties"]["title"]: s["properties"] for s in meta["sheets"]}
-        required = {self.main_tab, "Журнал", "Борги"}
+        return {s["properties"]["title"]: s["properties"] for s in meta["sheets"]}
+
+    def validate(self):
+        tabs = self.metadata()
+        required = {"Журнал", "Борги"}
         missing = required - set(tabs)
         if missing:
             raise ValueError("Не знайдено вкладки: " + ", ".join(sorted(missing))
                              + ". Перевір назви та BUDGET_MONTH_TAB у Render.")
         self.journal_id = tabs["Журнал"]["sheetId"]
+        self.journal_last = tabs["Журнал"]["gridProperties"]["rowCount"]
         if tabs["Журнал"]["gridProperties"]["rowCount"] < 308:
             raise ValueError("У журналі замало рядків.")
         if self.values("'Журнал'!A4:G4") != [HEADER]:
             raise ValueError("Заголовки журналу не відповідають структурі бюджету.")
-        name = self.main_tab.replace("'", "''")
-        if [r[0] for r in self.values(f"'{name}'!B16:B30")] != CATEGORIES:
+        self.template(self.today(), tabs)
+
+    def template(self, day, tabs=None):
+        """Use a dated opening balance, never a month name alone (December -> January)."""
+        tabs = tabs if tabs is not None else self.metadata()
+        candidates = []
+        for title in tabs:
+            if title == self.main_tab or any(title.casefold().startswith(m.casefold()) for m in MONTHS) or re.fullmatch(r'\d{4}-\d{2}', title):
+                name = title.replace("'", "''")
+                heading = self.values(f"'{name}'!A1:A1")
+                text = str(heading[0][0]) if heading and heading[0] else ''
+                matches = [(i + 1, re.search(r'\b(20\d{2})\b', text)) for i, m in enumerate(MONTHS) if m.casefold() in text.casefold()]
+                if len(matches) != 1 or not matches[0][1]:
+                    continue
+                month, year_match = matches[0]
+                start = date(int(year_match[1]), month, 1)
+                if start <= day:
+                    candidates.append((start, title))
+        if not candidates:
+            raise ValueError('Немає датованої вкладки бюджету для цієї дати. Перевір заголовок A1: місяць і рік.')
+        latest = max(s for s, _ in candidates)
+        choices = [(s, t) for s, t in candidates if s == latest]
+        if len(choices) != 1:
+            raise ValueError('Знайдено кілька бюджетів одного місяця. Залиш одну датовану вкладку.')
+        start, title = choices[0]
+        name = title.replace("'", "''")
+        categories = self.values(f"'{name}'!A16:E30")
+        accounts = self.values(f"'{name}'!A36:E43")
+        if [r[1] if len(r) > 1 else '' for r in categories] != CATEGORIES:
             raise ValueError("Категорії таблиці змінилися; онови налаштування бота.")
-        if [r[0] for r in self.values(f"'{name}'!A36:A43")] != ACCOUNTS:
+        if [r[0] if r else '' for r in accounts] != ACCOUNTS:
             raise ValueError("Рахунки таблиці змінилися; онови налаштування бота.")
+        return start, title, categories, accounts
+
+    def validate_date(self, day):
+        if day > self.today():
+            raise ValueError('Майбутні операції не записуємо — тільки факт.')
+        self.template(day)
+
+    def snapshot(self):
+        day = self.today()
+        tabs = self.metadata()
+        self.journal_last = tabs['Журнал']['gridProperties']['rowCount']
+        start, title, categories, accounts = self.template(day, tabs)
+        name = title.replace("'", "''")
+        other = self.values(f"'{name}'!K21:K21")
+        return calculate(day, start, title, categories, accounts,
+                         self.values(f"'Журнал'!A5:G{self.journal_last}"),
+                         self.values("'Борги'!A4:F53"), other[0][0] if other and other[0] else 0)
 
     def cells(self, first, last):
         data = self.request("GET", params={"ranges": f"'Журнал'!A{first}:G{last}",
@@ -70,7 +118,10 @@ class Sheets:
         return rows
 
     def journal(self):
-        return self.cells(5, 308)
+        # Grid size may have been expanded manually; markers remain in the same journal.
+        tabs = self.metadata()
+        self.journal_last = tabs['Журнал']['gridProperties']['rowCount']
+        return self.cells(5, self.journal_last)
 
     def row(self, number):
         return self.cells(number, number)[0]
@@ -90,35 +141,16 @@ class Sheets:
         ]})
 
     def summary(self):
-        name = self.main_tab.replace("'", "''")
-        rows = self.values(f"'{name}'!A5:H10")
-        def n(r, c):
-            return rows[r][c] if len(rows) > r and len(rows[r]) > c else 0
-        return (f"📊 {self.main_tab}\nОпераційно: {n(1, 1):,.2f} грн\n"
-                f"Банка: {n(2, 1):,.2f} грн\nЛіміти: {n(1, 4):,.2f} грн\n"
-                f"Надходження: {n(3, 1):,.2f} грн\nВитрати: {n(4, 1):,.2f} грн\n"
-                f"Використано бюджету: {spent_percent(n(4, 1), n(1, 4))}\n"
-                f"Залишок лімітів: {n(1, 4) - n(4, 1):,.2f} грн\n"
-                f"Нерозподілено: {n(2, 4):,.2f} грн\n"
-                f"Мені винні: {n(5, 1):,.2f} грн — поза ресурсом бюджету.")
+        return self.snapshot().summary()
 
-    def categories_summary(self):
-        name = self.main_tab.replace("'", "''")
-        rows = self.values(f"'{name}'!B16:E30")
-        lines = [f'📈 {self.main_tab} · використання лімітів']
-        total_spent = total_limit = 0
-        for row in rows:
-            label = row[0]
-            limit = row[2] if len(row) > 2 and isinstance(row[2], (int, float)) else 0
-            spent = row[3] if len(row) > 3 and isinstance(row[3], (int, float)) else 0
-            total_spent += spent
-            total_limit += limit
-            icon = '🔴' if spent > limit else '🟡' if limit and spent / limit >= .8 else '🟢'
-            lines.append(f'\n{icon} {label} · {spent_percent(spent, limit)}\n'
-                         f'{spent:,.2f} / {limit:,.2f} грн')
-        lines.append(f'\nЗагалом: {total_spent:,.2f} / {total_limit:,.2f} грн · '
-                     f'{spent_percent(total_spent, total_limit)}')
-        return '\n'.join(lines)
+    def categories_summary(self, show_all=False):
+        return self.snapshot().category_text(show_all)
+
+    def risks(self):
+        return self.snapshot().risks()
+
+    def forecast(self):
+        return self.snapshot().forecast()
 
     def day_expenses(self, day):
         from datetime import date
