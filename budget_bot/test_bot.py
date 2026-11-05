@@ -1,10 +1,10 @@
 """Telegram flows with real aiogram types and fake Sheet; never send messages."""
-import tempfile
+import asyncio
 import unittest
 import uuid
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from zoneinfo import ZoneInfo
 from aiogram.types import User, Chat, Message, CallbackQuery
 from budget_bot import BudgetBot
@@ -85,6 +85,74 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.setting('reminders_enabled'), '1')
         await self.app.stop(self.message('/stop'))
         self.assertEqual(self.store.setting('reminders_enabled'), '0')
+
+    async def test_report_buttons_and_show_all(self):
+        self.sheet.summary = Mock(return_value='overview')
+        self.sheet.categories_summary = Mock(return_value='categories')
+        self.sheet.risks = Mock(return_value='risks')
+        self.sheet.forecast = Mock(return_value='forecast')
+        for data in ['summary', 'categories', 'categories:all', 'risks', 'forecast']:
+            await self.app.callback(self.callback(data))
+        self.sheet.categories_summary.assert_any_call()
+        self.sheet.categories_summary.assert_any_call(True)
+        self.sheet.risks.assert_called_once()
+        self.sheet.forecast.assert_called_once()
+
+    async def test_automatic_mode_confirms_old_draft_after_month_rollover(self):
+        self.app.year = self.app.month = None
+        self.sheet.validate_date = Mock()
+        draft = new_draft('Надходження', datetime(2026, 10, 31).date())
+        draft.update(amount='100', account='Готівка', description='факт', step='confirm')
+        self.store.save_draft(123, draft)
+        with patch('budget_bot.datetime') as clock:
+            clock.now.return_value = datetime(2026, 11, 1, 0, 1, tzinfo=ZoneInfo('Europe/Kyiv'))
+            await self.app.callback(self.callback(f'd:{draft["id"]}:confirm:0'))
+            await self.app.callback(self.callback(f'd:{draft["id"]}:confirm:0'))
+        self.assertEqual(self.sheet.writes, 1)
+        self.assertEqual(self.sheet.rows[0][0][0], 46326)
+
+    async def test_yesterday_on_first_day_and_future_date(self):
+        self.app.year = self.app.month = None
+        self.sheet.validate_date = Mock()
+        with patch('budget_bot.datetime') as clock:
+            clock.now.return_value = datetime(2027, 1, 1, 0, 1, tzinfo=ZoneInfo('Europe/Kyiv'))
+            await self.app.callback(self.callback('new:expense:yesterday'))
+            self.assertEqual(self.store.draft(123)['date'], '2026-12-31')
+            await self.app.text(self.message('/date 2027-01-02'))
+            self.assertEqual(self.store.draft(123)['date'], '2026-12-31')
+
+    async def test_pending_queue_replays_after_month_change_without_duplicate(self):
+        self.app.year = self.app.month = None
+        self.sheet.validate_date = Mock()
+        draft = new_draft('Надходження', datetime(2026, 10, 31).date())
+        draft.update(amount='100', account='Готівка', description='факт', step='confirm')
+        self.store.save_draft(123, draft)
+        self.sheet.lose_response = True
+        await self.app.callback(self.callback(f'd:{draft["id"]}:confirm:0'))
+        self.store.close()
+        self.store = Store(self.directory / 'budget.sqlite3')
+        self.app.store = self.store
+        self.assertEqual(self.store.commit(draft['id'], self.sheet), 5)
+        self.assertEqual(self.sheet.writes, 1)
+
+    async def test_unauthorized_report_callback_cannot_read_sheets(self):
+        self.sheet.summary = Mock(side_effect=AssertionError('unauthorized read'))
+        callback = self.callback('summary').model_copy(update={'from_user': User(id=456, is_bot=False, first_name='other')})
+        await self.app.callback(callback)
+        self.sheet.summary.assert_not_called()
+
+    async def test_first_morning_reminder_checks_previous_month(self):
+        self.app.year = self.app.month = None
+        self.sheet.day_expenses = Mock(return_value=[])
+        self.store.set_setting('reminders_enabled', '1')
+        bot = Mock(send_message=AsyncMock())
+        with patch('budget_bot.datetime') as clock, patch('budget_bot.asyncio.sleep', side_effect=asyncio.CancelledError):
+            clock.now.return_value = datetime(2026, 11, 1, 9, 1, tzinfo=ZoneInfo('Europe/Kyiv'))
+            with self.assertRaises(asyncio.CancelledError):
+                await self.app.background(bot)
+        self.sheet.day_expenses.assert_called_once_with(datetime(2026, 10, 31).date())
+        bot.send_message.assert_awaited_once()
+        self.assertIn('31.10.2026', bot.send_message.await_args.args[1])
 
 
 class AdapterTests(unittest.TestCase):

@@ -34,9 +34,16 @@ def keyboard(rows):
 
 def menu():
     return keyboard([[('➖ Витрата', 'new:expense:today'), ('➕ Надходження', 'new:income:today')],
-                     [('🔁 Переказ', 'new:transfer:today'), ('📊 Залишки', 'summary')],
+                     [('🔁 Переказ', 'new:transfer:today'), ('📊 Бюджет', 'summary')],
                      [('📅 За вчора', 'new:expense:yesterday'), ('📈 Категорії', 'categories')],
+                     [('⚠️ Ризики', 'risks'), ('📅 Прогноз', 'forecast')],
                      [('🔔 Увімкнути нагадування', 'reminders:on'), ('🔕 Вимкнути', 'reminders:off')]])
+
+
+def category_menu(show_all=False):
+    return keyboard([[('Лише з витратами' if show_all else 'Показати всі',
+                       'categories' if show_all else 'categories:all')],
+                     [('📊 Бюджет', 'summary'), ('⚠️ Ризики', 'risks')]])
 
 
 def choice(draft, action, values):
@@ -47,7 +54,7 @@ def choice(draft, action, values):
 
 
 class BudgetBot:
-    def __init__(self, owner, sheets, store, year, month):
+    def __init__(self, owner, sheets, store, year=None, month=None):
         self.owner, self.sheets, self.store = owner, sheets, store
         self.year, self.month = year, month
         # One lock includes both the Sheets session and all journal reservations.
@@ -59,6 +66,16 @@ class BudgetBot:
         self.dp.message.register(self.status, Command('status'))
         self.dp.callback_query.register(self.callback, F.data)
         self.dp.message.register(self.text, F.text)
+
+    async def validate_date(self, day):
+        if day > datetime.now(TZ).date():
+            raise ValueError('Майбутні операції не записуємо — тільки факт.')
+        if self.year is not None:
+            if (day.year, day.month) != (self.year, self.month):
+                raise ValueError('Ця дата поза місяцем таблиці.')
+        else:
+            async with self.lock:
+                await asyncio.to_thread(self.sheets.validate_date, day)
 
     def allowed(self, event):
         user = event.from_user
@@ -72,7 +89,7 @@ class BudgetBot:
         self.store.set_setting('reminders_enabled', '1')
         await message.answer('💳 Особистий бюджет\nОбери операцію. Зберігаю тільки після підтвердження.\n'
                              'Нагадування: 23:00 за день і 09:01 за вчора, за Києвом.\n'
-                             'Бот підключений до одного місяця; наприкінці місяця таблицю потрібно перемкнути.',
+                             'Місяць змінюється автоматично, усі операції — в одному Журналі.',
                              reply_markup=menu())
         draft = self.store.draft(self.owner)
         if draft:
@@ -155,11 +172,16 @@ class BudgetBot:
         msg = callback.message
         data = callback.data
         try:
-            if data in {'summary', 'categories'}:
+            if data in {'summary', 'categories', 'categories:all', 'risks', 'forecast'}:
+                show_all = data == 'categories:all'
+                reader = {'summary': self.sheets.summary,
+                          'categories': self.sheets.categories_summary,
+                          'categories:all': self.sheets.categories_summary,
+                          'risks': self.sheets.risks,
+                          'forecast': self.sheets.forecast}[data]
                 async with self.lock:
-                    text = await asyncio.to_thread(self.sheets.summary if data == 'summary'
-                                                   else self.sheets.categories_summary)
-                await msg.answer(text, reply_markup=menu())
+                    text = await asyncio.to_thread(reader, True) if show_all else await asyncio.to_thread(reader)
+                await msg.answer(text, reply_markup=category_menu(show_all) if data.startswith('categories') else menu())
                 return
             if data.startswith('reminders:'):
                 enabled = data.endswith(':on')
@@ -170,8 +192,7 @@ class BudgetBot:
                 _, kind, when = data.split(':')
                 kinds = {'expense': 'Витрата', 'income': 'Надходження', 'transfer': 'Переказ'}
                 day = datetime.now(TZ).date() - timedelta(days=1 if when == 'yesterday' else 0)
-                if (day.year, day.month) != (self.year, self.month):
-                    raise ValueError('Ця дата поза місяцем таблиці. Спочатку підключи потрібний місяць.')
+                await self.validate_date(day)
                 if self.store.draft(self.owner):
                     raise ValueError('Є незавершений запис. Спершу заверши його або /cancel.')
                 draft = new_draft(kinds[kind], day)
@@ -217,6 +238,7 @@ class BudgetBot:
                 draft['description'] = ''
                 await self.review(msg, draft)
             elif action == 'confirm' and draft['step'] == 'confirm':
+                await self.validate_date(date.fromisoformat(draft['date']))
                 payload = journal_row(draft, self.year, self.month)
                 async with self.lock:
                     self.store.enqueue(token, payload, self.sheets.spreadsheet_id)
@@ -250,10 +272,7 @@ class BudgetBot:
         try:
             if message.text.startswith('/date '):
                 day = date.fromisoformat(message.text.split(maxsplit=1)[1])
-                if (day.year, day.month) != (self.year, self.month):
-                    raise ValueError('Дата має бути в межах підключеного місяця.')
-                if day > datetime.now(TZ).date():
-                    raise ValueError('Майбутні операції не записуємо — тільки факт.')
+                await self.validate_date(day)
                 draft['date'] = day.isoformat()
                 self.store.save_draft(self.owner, draft)
                 await message.answer(f'Дата змінена на {day:%d.%m.%Y}.')
@@ -287,6 +306,9 @@ class BudgetBot:
                 await message.answer('Продовжуй кнопками. Змінити дату: /date 2026-10-01. Скасувати: /cancel.')
         except ValueError as exc:
             await message.answer(str(exc))
+        except Exception as exc:
+            log.warning('Draft update failed: %s', type(exc).__name__)
+            await message.answer('Не вдалося перевірити дату в таблиці. Чернетка збережена; спробуй пізніше.')
 
     async def background(self, bot):
         retry_at = 0.0
@@ -309,7 +331,7 @@ class BudgetBot:
                     sent = {r[0] for r in self.store.conn.execute('SELECT key FROM reminders')}
                     for key, kind, scheduled_day in reminder_due(now, sent):
                         target = scheduled_day if kind == 'evening' else scheduled_day - timedelta(days=1)
-                        if (target.year, target.month) != (self.year, self.month):
+                        if self.year is not None and (target.year, target.month) != (self.year, self.month):
                             text = '📅 Потрібно підключити бюджетну таблицю нового місяця.'
                             buttons = menu()
                         else:
@@ -341,14 +363,12 @@ async def main():
     owner = int(os.environ['BUDGET_OWNER_ID'])
     if owner <= 0:
         raise RuntimeError('BUDGET_OWNER_ID має бути додатним числом.')
-    year, month = int(os.getenv('BUDGET_YEAR', '2026')), int(os.getenv('BUDGET_MONTH', '10'))
-    date(year, month, 1)
     directory = Path(os.getenv('BUDGET_DATA_DIR', str(Path(os.getenv('DATA_DIR', '/var/data')) / 'budget')))
     sheets = Sheets(os.environ['BUDGET_SPREADSHEET_ID'], os.environ['GOOGLE_SERVICE_ACCOUNT_JSON'],
-                    os.getenv('BUDGET_MONTH_TAB', 'Жовтень'))
+                    os.getenv('BUDGET_MONTH_TAB'))
     await asyncio.to_thread(sheets.validate)
     store = Store(directory / 'budget.sqlite3')
-    app = BudgetBot(owner, sheets, store, year, month)
+    app = BudgetBot(owner, sheets, store)
     bot = Bot(os.environ['BUDGET_BOT_TOKEN'])
     background = None
     try:

@@ -191,6 +191,17 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.enqueue('a', ['other'], self.sheet.spreadsheet_id)
 
+    def test_expanded_single_journal_recovers_marker_after_old_boundary(self):
+        self.sheet.rows = [(['occupied'] * 7, '') for _ in range(304)] + [([''] * 7, '') for _ in range(700)]
+        self.queue()
+        self.sheet.lose_response = True
+        with self.assertRaises(TimeoutError):
+            self.store.commit('a', self.sheet)
+        self.store.close()
+        self.store = Store(self.path)
+        self.assertEqual(self.store.commit('a', self.sheet), 309)
+        self.assertEqual(self.sheet.writes, 1)
+
 
 if __name__ == '__main__':
     unittest.main()
